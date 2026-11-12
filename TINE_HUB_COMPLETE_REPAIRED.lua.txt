@@ -1,0 +1,3225 @@
+--[[
+    ============================================================================
+    TINE HUB — BLOX FRUITS AUTO LEVEL (FIRST SEA 1–699 / STOP AT 700)
+    File        : TINE_HUB_COMPLETE_REPAIRED.lua
+    Edition     : Post-Quest Freeze Fix, Hybrid Progression & Faction-Aware Engine
+    Target Place: 2753915549 (Blox Fruits — First Sea)
+    Compatibility: Delta / Mobile / PC Luau Environments
+    ============================================================================
+
+    CRITICAL ROOT-CAUSE FIXES IN THIS VERSION:
+    1. Fixed Post-Quest NPC Freeze (`FindActiveQuestFrame` False-Positive Menu Button Lock):
+       - Previously, Pass 2 of `FindActiveQuestFrame()` matched any visible GuiObject named `"Quest"`
+         (such as the HUD menu/compass `"Quest"` button whose TextLabel just says `"Quest"` or `"Misi"`)
+         and cached it permanently in `CachedQuestFrame`.
+       - Because `"Quest"` / `"Misi"` was filtered by `IsIgnoredQuestLabelText`, `ReadQuestTitle()`
+         returned `true, "", ""` (`QUEST_READ_PENDING`) on every tick, trapping the FSM in an infinite
+         `VERIFYING_QUEST <-> RECOVERING <-> TAKING_QUEST` loop right in front of the Quest NPC!
+       - Fix: A GuiObject is ONLY accepted as a Quest frame if it is a `Frame` (never a `TextButton`/`ImageButton`)
+         AND contains actual quest objective text (`"defeat"`, `"kalahkan"`, a stage mob alias, or an `X/Y` fraction).
+         If a cached frame ever lacks valid objective text, the cache is invalidated immediately.
+    2. Combined Multi-Label Quest Snapshot (`ReadQuestTitle`):
+       - Concatenates all visible non-ignored `TextLabel` strings inside the active Quest container
+         so split title + progress labels (e.g. `"Kalahkan 5 Peserta Pelatihan"` + `"0/5"`) are always
+         evaluated together.
+    3. Guaranteed Forward Progression from Quest NPC to Mobs (`VERIFYING_QUEST` -> `FARMING`):
+       - Once the character stands at `stage.QuestNPC` (`<= 14` studs) and invokes `StartQuest`,
+         it verifies the UI for up to `1.0s` and then ALWAYS advances to `FARMING` (never looping
+         `AbandonQuest` or standing still at the Quest NPC).
+    4. Hybrid UI + Authoritative Kill/EXP Completion Tracking (`FARMING`):
+       - Prevents `FARMING` from prematurely exiting to `COMPLETED` with 0 kills if the Quest UI
+         takes a moment to render or uses a custom/minimal HUD layout.
+       - Tracks both live HUD progress `(X/Y)` and real-time target NPC deaths (`LocalSessionKills`)
+         until all required NPCs (`ExpectedCount`) are defeated.
+    5. Faction-Aware Starter Selection (`Pirates` Bandit vs `Marines` Trainee / Peserta Pelatihan):
+       - Detects actual player faction and supports bilingual (Indonesian & English) mob/quest aliases.
+]]
+
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+-- ================= ROBLOX SERVICES =================
+
+local Players = game:GetService("Players")
+local Teams = game:GetService("Teams")
+local RS = game:GetService("ReplicatedStorage")
+local VU = game:GetService("VirtualUser")
+local TweenService = game:GetService("TweenService")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local VIM = nil
+pcall(function()
+    VIM = game:GetService("VirtualInputManager")
+end)
+
+local LP = Players.LocalPlayer
+
+-- ================= CENTRALIZED CONFIGURATION =================
+
+local Config = {
+    FirstSeaPlaceId = 2753915549,
+    MinFirstSeaLevel = 1,
+    MaxFirstSeaLevel = 700,
+
+    DefaultTeam = "Pirates",
+    WeaponType = "Melee",
+    AutoStatsTarget = "Melee", -- Strictly Melee Only
+    MaxStatCap = 2550,
+
+    TweenSpeed = 210,
+    TweenSpeedPresets = {180, 210, 240},
+    TweenSpeedIndex = 2,
+
+    HoverHeight = 3.5,
+    HoverBackOffset = 2.0,
+    AttackRange = 35.0,
+    ArrivalThreshold = 8.0,
+    MaxMoveDuration = 45.0,
+
+    BringMobRadius = 160.0,
+    MaxBringMobs = 5,
+
+    FastAttack = true,
+    BringMob = true,
+    AutoHaki = true,
+    AutoStatsMelee = true,
+
+    MainLoopInterval = 0.08,
+    FastAttackInterval = 0.12,
+    NormalAttackInterval = 0.28,
+    HakiInterval = 8.0,
+    StatInterval = 1.0,
+    SpawnCacheTTL = 15.0,
+
+    QuestSettleDelay = 0.20,
+    QuestVerifyTimeout = 1.00, -- Fast verification window before advancing to FARMING
+    QuestLateUIGrace = 1.00,
+    QuestRetryDelay = 1.20,
+    QuestMaxTries = 3,
+    QuestCompleteDelay = 0.45,
+    MaxNavRetries = 3,
+
+    RemoteTimeout = 3.5,
+    RespawnSettleDelay = 0.50,
+    RespawnMaxWait = 12.0,
+    WorkerWatchdogTimeout = 2.5,
+
+    StuckCheckInterval = 1.5,
+    StuckMinMoveDist = 2.0,
+    MobBlacklistDuration = 4.0,
+    WarnThrottleInterval = 4.0
+}
+
+-- Known First Sea Melee / Fighting Style names (English & Indonesian)
+local KnownMeleeToolNames = {
+    ["combat"] = true,
+    ["kombo"] = true,
+    ["pertarungan"] = true,
+    ["black leg"] = true,
+    ["dark step"] = true,
+    ["langkah gelap"] = true,
+    ["electro"] = true,
+    ["electric"] = true,
+    ["elektro"] = true,
+    ["fishman karate"] = true,
+    ["karate manusia ikan"] = true,
+    ["water kung fu"] = true,
+    ["kung fu air"] = true,
+    ["dragon breath"] = true,
+    ["napas naga"] = true,
+    ["superhuman"] = true,
+    ["manusia super"] = true
+}
+
+local KnownMeleeToolTips = {
+    ["melee"] = true,
+    ["jarak dekat"] = true,
+    ["pertarungan"] = true
+}
+
+-- ================= ENVIRONMENT & DIAGNOSTICS STATE =================
+
+local env = (typeof(getgenv) == "function" and getgenv()) or _G
+
+if env.BFAutoFarmStop then
+    pcall(env.BFAutoFarmStop)
+end
+
+local HasSetHiddenProperty = (typeof(sethiddenproperty) == "function")
+local GetUpvaluesFn = (typeof(getupvalues) == "function" and getupvalues)
+    or (typeof(debug) == "table" and typeof(debug.getupvalues) == "function" and debug.getupvalues)
+    or nil
+local HasGetUpvalues = (GetUpvaluesFn ~= nil)
+
+local WarnTimestamps = {}
+
+local DiagState = {
+    Level = 1,
+    Faction = "Checking...",
+    FSMState = "INITIALIZING",
+    TargetStage = "None",
+    QuestName = "None",
+    QuestStatus = "QUEST_NOT_STARTED",
+    NavigationStatus = "IDLE",
+    WeaponStatus = "WEAPON_NOT_FOUND",
+    CombatStatus = "COMBAT_DISABLED",
+    TargetStatus = "TARGET_NOT_FOUND",
+    SelectedTarget = "None",
+    TargetHealth = "0/0",
+    TargetDistance = -1,
+    TotalEnemies = 0,
+    MatchingEnemies = 0,
+    WorkerStatus = "STARTING",
+    LastError = "None",
+    AttackCount = 0
+}
+
+local function RecordError(location, err)
+    local now = os.clock()
+    local shortErr = string.gsub(tostring(err), "\n.*", "")
+    local msg = string.format("[%s] %s", tostring(location), shortErr)
+    DiagState.LastError = msg
+
+    local last = WarnTimestamps[location]
+    if not last or (now - last) >= Config.WarnThrottleInterval then
+        WarnTimestamps[location] = now
+        warn("[TineHub][ERROR] " .. msg)
+    end
+end
+
+-- ================= LIFECYCLE & STATE MACHINE VARIABLES =================
+
+local Alive = true
+local Running = true
+local IsStopped = false
+local IsRespawning = false
+local RespawnStartedAt = 0
+local RespawnToken = 0
+local LifecycleEpoch = 1
+
+local function BumpEpoch()
+    LifecycleEpoch += 1
+    return LifecycleEpoch
+end
+
+local function CanContinue(expectedEpoch)
+    if not Alive or not Running or IsRespawning then
+        return false
+    end
+    if expectedEpoch and expectedEpoch ~= LifecycleEpoch then
+        return false
+    end
+    return true
+end
+
+-- State Machine States:
+-- "INITIALIZING" | "CHECKING_TEAM" | "SELECTING_QUEST" | "TAKING_QUEST"
+-- | "VERIFYING_QUEST" | "FARMING" | "RECOVERING" | "COMPLETED" | "IDLE" | "ERROR"
+local FSMState = "INITIALIZING"
+local LockedStage = nil
+local LastRequestedStage = nil
+local LastStartQuestAt = 0
+local QuestCurrentCount = 0
+local QuestRequiredCount = 0
+local LocalSessionKills = 0
+local UIQuestConfirmedThisCycle = false
+local FarmingStartedAt = 0
+local QuestVerifyDeadline = 0
+local QuestNextAttempt = 0
+local QuestAttemptCount = 0
+local QuestCompletionStartedAt = 0
+local NavRetryCount = 0
+local RecoveryReason = ""
+local RecoveryStartedAt = 0
+
+local function TransitionFSM(newState)
+    if FSMState ~= newState then
+        FSMState = newState
+        DiagState.FSMState = newState
+    end
+end
+
+-- Character & Combat State
+local CharRef = nil
+local HumRef = nil
+local RootRef = nil
+local CachedWeapon = nil
+local CombatTarget = nil
+local IsAttacking = false
+local CombatWorkerId = 0
+local CombatWorkerHeartbeatAt = 0
+
+local NextAttackAt = 0
+local NextHakiAt = 0
+local NextStatAt = 0
+local NextSimRadiusAt = 0
+
+-- Movement State
+local ActiveTween = nil
+local MoveToken = 0
+local StabilizerBV = nil
+local SpawnPatrolIndex = 1
+local LastSpawnPatrolAt = 0
+
+-- Weak Tables & Caches
+local MobBlacklist = setmetatable({}, { __mode = "k" })
+local OriginalCollideState = setmetatable({}, { __mode = "k" })
+local OriginalMobState = setmetatable({}, { __mode = "k" })
+local CountedDeadMobs = setmetatable({}, { __mode = "k" })
+local CachedCharParts = {}
+local SpawnNodesCache = {}
+
+-- Cached Quest GUI References
+local CachedQuestFrame = nil
+local CachedQuestTitle = nil
+
+-- Connection Registries
+local GlobalConnections = {}
+local CharConnections = {}
+
+local function RegisterGlobalConn(conn)
+    if conn then
+        table.insert(GlobalConnections, conn)
+    end
+    return conn
+end
+
+local function ClearCharConnections()
+    for i = #CharConnections, 1, -1 do
+        local conn = CharConnections[i]
+        CharConnections[i] = nil
+        pcall(function()
+            conn:Disconnect()
+        end)
+    end
+end
+
+-- ================= FACTION-AWARE STAGE DATABASE (1–699) =================
+
+local FISHMAN_ENTRANCE_FROM = CFrame.new(3865, 7, -1926)
+local FISHMAN_ENTRANCE_TO   = Vector3.new(61164, 12, 1820)
+local FISHMAN_EXIT_TO       = Vector3.new(3865, 7, -1926)
+
+local SKY_ENTRANCE_FROM     = CFrame.new(-4608, 873, -1668)
+local SKY_ENTRANCE_TO       = Vector3.new(-7895, 5547, -380)
+
+local Stages = {
+    {
+        MinLevel = 1, MaxLevel = 9,
+        Faction = "Pirates",
+        MobName = "Bandit",
+        Aliases = {"bandit", "bandits"},
+        QuestName = "BanditQuest1", QuestIndex = 1,
+        QuestNPC = CFrame.new(1059, 16, 1550),
+        FallbackSpawn = CFrame.new(1145, 17, 1634),
+        PatrolPoints = {
+            CFrame.new(1145, 17, 1634),
+            CFrame.new(1046, 27, 1561),
+            CFrame.new(1196, 17, 1615)
+        },
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 5
+    },
+    {
+        MinLevel = 1, MaxLevel = 9,
+        Faction = "Marines",
+        MobName = "Trainee",
+        Aliases = {"trainee", "trainees", "peserta pelatihan"},
+        QuestName = "MarineQuest", QuestIndex = 1,
+        QuestNPC = CFrame.new(-2709, 25, 2104),
+        FallbackSpawn = CFrame.new(-2725, 25, 2063),
+        PatrolPoints = {
+            CFrame.new(-2725, 25, 2063),
+            CFrame.new(-2665, 25, 2045),
+            CFrame.new(-2750, 25, 2130)
+        },
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 5
+    },
+    {
+        MinLevel = 10, MaxLevel = 14,
+        Faction = "Any",
+        MobName = "Monkey",
+        Aliases = {"monkey", "monkeys", "monyet"},
+        QuestName = "JungleQuest", QuestIndex = 1,
+        QuestNPC = CFrame.new(-1598, 36, 153),
+        FallbackSpawn = CFrame.new(-1448, 68, 11),
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 6
+    },
+    {
+        MinLevel = 15, MaxLevel = 29,
+        Faction = "Any",
+        MobName = "Gorilla",
+        Aliases = {"gorilla", "gorillas", "gorila"},
+        QuestName = "JungleQuest", QuestIndex = 2,
+        QuestNPC = CFrame.new(-1598, 36, 153),
+        FallbackSpawn = CFrame.new(-1130, 40, -525),
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 8
+    },
+    {
+        MinLevel = 30, MaxLevel = 39,
+        Faction = "Any",
+        MobName = "Pirate",
+        Aliases = {"pirate", "pirates", "bajak laut"},
+        QuestName = "BuggyQuest1", QuestIndex = 1,
+        QuestNPC = CFrame.new(-1140, 5, 3827),
+        FallbackSpawn = CFrame.new(-1104, 14, 3896),
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 8
+    },
+    {
+        MinLevel = 40, MaxLevel = 59,
+        Faction = "Any",
+        MobName = "Brute",
+        Aliases = {"brute", "brutes", "brutal"},
+        QuestName = "BuggyQuest1", QuestIndex = 2,
+        QuestNPC = CFrame.new(-1140, 5, 3827),
+        FallbackSpawn = CFrame.new(-1140, 15, 4323),
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 8
+    },
+    {
+        MinLevel = 60, MaxLevel = 74,
+        Faction = "Any",
+        MobName = "Desert Bandit",
+        Aliases = {"desert bandit", "desert bandits", "bandit gurun"},
+        QuestName = "DesertQuest", QuestIndex = 1,
+        QuestNPC = CFrame.new(897, 6, 4390),
+        FallbackSpawn = CFrame.new(985, 16, 4418),
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 8
+    },
+    {
+        MinLevel = 75, MaxLevel = 89,
+        Faction = "Any",
+        MobName = "Desert Officer",
+        Aliases = {"desert officer", "desert officers", "perwira gurun", "petugas gurun"},
+        QuestName = "DesertQuest", QuestIndex = 2,
+        QuestNPC = CFrame.new(897, 6, 4390),
+        FallbackSpawn = CFrame.new(1547, 14, 4382),
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 6
+    },
+    {
+        MinLevel = 90, MaxLevel = 99,
+        Faction = "Any",
+        MobName = "Snow Bandit",
+        Aliases = {"snow bandit", "snow bandits", "bandit salju"},
+        QuestName = "SnowQuest", QuestIndex = 1,
+        QuestNPC = CFrame.new(1387, 87, -1298),
+        FallbackSpawn = CFrame.new(1356, 106, -1328),
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 7
+    },
+    {
+        MinLevel = 100, MaxLevel = 119,
+        Faction = "Any",
+        MobName = "Snowman",
+        Aliases = {"snowman", "snowmen", "manusia salju"},
+        QuestName = "SnowQuest", QuestIndex = 2,
+        QuestNPC = CFrame.new(1387, 87, -1298),
+        FallbackSpawn = CFrame.new(1219, 138, -1488),
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 8
+    },
+    {
+        MinLevel = 120, MaxLevel = 149,
+        Faction = "Any",
+        MobName = "Chief Petty Officer",
+        Aliases = {"chief petty officer", "chief petty officers", "kepala bintara", "petty officer"},
+        QuestName = "MarineQuest2", QuestIndex = 1,
+        QuestNPC = CFrame.new(-5035, 29, 4324),
+        FallbackSpawn = CFrame.new(-4931, 66, 4122),
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 8
+    },
+    {
+        MinLevel = 150, MaxLevel = 174,
+        Faction = "Any",
+        MobName = "Sky Bandit",
+        Aliases = {"sky bandit", "sky bandits", "bandit langit"},
+        QuestName = "SkyQuest", QuestIndex = 1,
+        QuestNPC = CFrame.new(-4842, 718, -2623),
+        FallbackSpawn = CFrame.new(-4956, 365, -2908),
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 7
+    },
+    {
+        MinLevel = 175, MaxLevel = 189,
+        Faction = "Any",
+        MobName = "Dark Master",
+        Aliases = {"dark master", "dark masters", "master kegelapan", "guru kegelapan"},
+        QuestName = "SkyQuest", QuestIndex = 2,
+        QuestNPC = CFrame.new(-4842, 718, -2623),
+        FallbackSpawn = CFrame.new(-5148, 439, -2333),
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 8
+    },
+    {
+        MinLevel = 190, MaxLevel = 209,
+        Faction = "Any",
+        MobName = "Prisoner",
+        Aliases = {"prisoner", "prisoners", "tahanan", "narapidana"},
+        QuestName = "PrisonerQuest", QuestIndex = 1,
+        QuestNPC = CFrame.new(5310, 0, 475),
+        FallbackSpawn = CFrame.new(5099, 0, 474),
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 8
+    },
+    {
+        MinLevel = 210, MaxLevel = 249,
+        Faction = "Any",
+        MobName = "Dangerous Prisoner",
+        Aliases = {"dangerous prisoner", "dangerous prisoners", "tahanan berbahaya", "narapidana berbahaya"},
+        QuestName = "PrisonerQuest", QuestIndex = 2,
+        QuestNPC = CFrame.new(5310, 0, 475),
+        FallbackSpawn = CFrame.new(5655, 16, 866),
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 8
+    },
+    {
+        MinLevel = 250, MaxLevel = 274,
+        Faction = "Any",
+        MobName = "Toga Warrior",
+        Aliases = {"toga warrior", "toga warriors", "pejuang toga", "ksatria toga"},
+        QuestName = "ColosseumQuest", QuestIndex = 1,
+        QuestNPC = CFrame.new(-1580, 6, -2986),
+        FallbackSpawn = CFrame.new(-1820, 52, -2741),
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 7
+    },
+    {
+        MinLevel = 275, MaxLevel = 299,
+        Faction = "Any",
+        MobName = "Gladiator",
+        Aliases = {"gladiator", "gladiators"},
+        QuestName = "ColosseumQuest", QuestIndex = 2,
+        QuestNPC = CFrame.new(-1580, 6, -2986),
+        FallbackSpawn = CFrame.new(-1293, 56, -3339),
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 8
+    },
+    {
+        MinLevel = 300, MaxLevel = 324,
+        Faction = "Any",
+        MobName = "Military Soldier",
+        Aliases = {"military soldier", "military soldiers", "prajurit militer", "tentara militer"},
+        QuestName = "MagmaQuest", QuestIndex = 1,
+        QuestNPC = CFrame.new(-5313, 11, 8515),
+        FallbackSpawn = CFrame.new(-5411, 11, 8454),
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 7
+    },
+    {
+        MinLevel = 325, MaxLevel = 374,
+        Faction = "Any",
+        MobName = "Military Spy",
+        Aliases = {"military spy", "military spies", "mata-mata militer"},
+        QuestName = "MagmaQuest", QuestIndex = 2,
+        QuestNPC = CFrame.new(-5313, 11, 8515),
+        FallbackSpawn = CFrame.new(-5803, 86, 8829),
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 8
+    },
+    {
+        MinLevel = 375, MaxLevel = 399,
+        Faction = "Any",
+        MobName = "Fishman Warrior",
+        Aliases = {"fishman warrior", "fishman warriors", "pejuang manusia ikan", "ksatria manusia ikan"},
+        QuestName = "FishmanQuest", QuestIndex = 1,
+        QuestNPC = CFrame.new(61123, 19, 1568),
+        FallbackSpawn = CFrame.new(60844, 98, 1298),
+        EntranceFrom = FISHMAN_ENTRANCE_FROM, EntranceTo = FISHMAN_ENTRANCE_TO,
+        ExpectedCount = 8
+    },
+    {
+        MinLevel = 400, MaxLevel = 449,
+        Faction = "Any",
+        MobName = "Fishman Commando",
+        Aliases = {"fishman commando", "fishman commandos", "komando manusia ikan"},
+        QuestName = "FishmanQuest", QuestIndex = 2,
+        QuestNPC = CFrame.new(61123, 19, 1568),
+        FallbackSpawn = CFrame.new(61738, 64, 1434),
+        EntranceFrom = FISHMAN_ENTRANCE_FROM, EntranceTo = FISHMAN_ENTRANCE_TO,
+        ExpectedCount = 7
+    },
+    {
+        MinLevel = 450, MaxLevel = 474,
+        Faction = "Any",
+        MobName = "God's Guard",
+        Aliases = {"god's guard", "god's guards", "penjaga dewa", "pengawal dewa"},
+        QuestName = "SkyExp1Quest", QuestIndex = 1,
+        QuestNPC = CFrame.new(-4722, 845, -1950),
+        FallbackSpawn = CFrame.new(-4628, 867, -1931),
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 7
+    },
+    {
+        MinLevel = 475, MaxLevel = 524,
+        Faction = "Any",
+        MobName = "Shanda",
+        Aliases = {"shanda", "shandas"},
+        QuestName = "SkyExp1Quest", QuestIndex = 2,
+        QuestNPC = CFrame.new(-7859, 5544, -381),
+        FallbackSpawn = CFrame.new(-7678, 5566, -497),
+        EntranceFrom = SKY_ENTRANCE_FROM, EntranceTo = SKY_ENTRANCE_TO,
+        ExpectedCount = 9
+    },
+    {
+        MinLevel = 525, MaxLevel = 549,
+        Faction = "Any",
+        MobName = "Royal Squad",
+        Aliases = {"royal squad", "royal squads", "pasukan kerajaan", "skuad kerajaan"},
+        QuestName = "SkyExp2Quest", QuestIndex = 1,
+        QuestNPC = CFrame.new(-7907, 5635, -1412),
+        FallbackSpawn = CFrame.new(-7624, 5658, -1467),
+        EntranceFrom = SKY_ENTRANCE_FROM, EntranceTo = SKY_ENTRANCE_TO,
+        ExpectedCount = 8
+    },
+    {
+        MinLevel = 550, MaxLevel = 624,
+        Faction = "Any",
+        MobName = "Royal Soldier",
+        Aliases = {"royal soldier", "royal soldiers", "prajurit kerajaan", "tentara kerajaan"},
+        QuestName = "SkyExp2Quest", QuestIndex = 2,
+        QuestNPC = CFrame.new(-7907, 5635, -1412),
+        FallbackSpawn = CFrame.new(-7837, 5638, -1795),
+        EntranceFrom = SKY_ENTRANCE_FROM, EntranceTo = SKY_ENTRANCE_TO,
+        ExpectedCount = 8
+    },
+    {
+        MinLevel = 625, MaxLevel = 649,
+        Faction = "Any",
+        MobName = "Galley Pirate",
+        Aliases = {"galley pirate", "galley pirates", "bajak laut galley", "bajak laut kapal"},
+        QuestName = "FountainQuest", QuestIndex = 1,
+        QuestNPC = CFrame.new(5258, 39, 4050),
+        FallbackSpawn = CFrame.new(5557, 152, 3999),
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 8
+    },
+    {
+        MinLevel = 650, MaxLevel = 699,
+        Faction = "Any",
+        MobName = "Galley Captain",
+        Aliases = {"galley captain", "galley captains", "kapten galley", "kapten kapal"},
+        QuestName = "FountainQuest", QuestIndex = 2,
+        QuestNPC = CFrame.new(5258, 39, 4050),
+        FallbackSpawn = CFrame.new(5678, 93, 4967),
+        EntranceFrom = nil, EntranceTo = nil,
+        ExpectedCount = 9
+    }
+}
+
+local StagesBySpecificity = {}
+for i = 1, #Stages do
+    StagesBySpecificity[i] = Stages[i]
+end
+table.sort(StagesBySpecificity, function(a, b)
+    if #a.MobName ~= #b.MobName then
+        return #a.MobName > #b.MobName
+    end
+    return a.MinLevel < b.MinLevel
+end)
+
+local function IsValidVector3(v)
+    if typeof(v) ~= "Vector3" then return false end
+    if v.X ~= v.X or v.Y ~= v.Y or v.Z ~= v.Z then return false end
+    if math.abs(v.X) > 1e6 or math.abs(v.Y) > 1e6 or math.abs(v.Z) > 1e6 then return false end
+    return true
+end
+
+local function IsValidCFrame(cf)
+    if typeof(cf) ~= "CFrame" then return false end
+    local x, y, z, r00, _, _, _, r11, _, _, _, r22 = cf:GetComponents()
+    if x ~= x or y ~= y or z ~= z then return false end
+    if r00 ~= r00 or r11 ~= r11 or r22 ~= r22 then return false end
+    if math.abs(x) > 1e6 or math.abs(y) > 1e6 or math.abs(z) > 1e6 then return false end
+    return true
+end
+
+local function SafeUprightCF(pos)
+    if not IsValidVector3(pos) then
+        return nil
+    end
+    return CFrame.new(pos.X, pos.Y, pos.Z)
+end
+
+local function BuildCombatHoverCF(mobPos)
+    if not IsValidVector3(mobPos) then
+        return nil
+    end
+    local hoverPos = Vector3.new(
+        mobPos.X,
+        mobPos.Y + Config.HoverHeight,
+        mobPos.Z + Config.HoverBackOffset
+    )
+    local cf = CFrame.lookAt(hoverPos, mobPos, Vector3.yAxis)
+    if IsValidCFrame(cf) then
+        return cf, hoverPos
+    end
+    return SafeUprightCF(hoverPos), hoverPos
+end
+
+local function ValidateStageDatabase(stageList)
+    if typeof(stageList) ~= "table" or #stageList == 0 then
+        return false, "Stage list is empty"
+    end
+
+    local coveredLevels = {}
+    for i, st in ipairs(stageList) do
+        if typeof(st.MinLevel) ~= "number" or typeof(st.MaxLevel) ~= "number" or st.MinLevel > st.MaxLevel then
+            return false, string.format("Invalid level bounds at stage #%d", i)
+        end
+        if typeof(st.MobName) ~= "string" or st.MobName == "" then
+            return false, string.format("Invalid MobName at stage #%d", i)
+        end
+        if typeof(st.QuestName) ~= "string" or st.QuestName == "" then
+            return false, string.format("Invalid QuestName at stage #%d", i)
+        end
+        if typeof(st.QuestIndex) ~= "number" or st.QuestIndex < 1 then
+            return false, string.format("Invalid QuestIndex at stage #%d", i)
+        end
+        if not IsValidCFrame(st.QuestNPC) or not IsValidCFrame(st.FallbackSpawn) then
+            return false, string.format("Invalid CFrame coordinate at stage #%d (%s)", i, st.MobName)
+        end
+        if typeof(st.ExpectedCount) ~= "number" or st.ExpectedCount < 1 then
+            return false, string.format("Invalid ExpectedCount at stage #%d", i)
+        end
+        for lv = st.MinLevel, st.MaxLevel do
+            coveredLevels[lv] = true
+        end
+    end
+
+    for lv = Config.MinFirstSeaLevel, (Config.MaxFirstSeaLevel - 1) do
+        if not coveredLevels[lv] then
+            return false, string.format("Uncovered level %d in stage database", lv)
+        end
+    end
+
+    return true, "OK"
+end
+
+local function GetPlayerFaction()
+    local team = LP.Team
+    if team and team.Name and team.Name ~= "" then
+        local tName = string.lower(team.Name)
+        if string.find(tName, "marine", 1, true) then
+            DiagState.Faction = "Marines"
+            return "Marines"
+        elseif string.find(tName, "pirate", 1, true) then
+            DiagState.Faction = "Pirates"
+            return "Pirates"
+        end
+        DiagState.Faction = team.Name
+        return team.Name
+    end
+
+    if Teams and LP.TeamColor then
+        for _, t in ipairs(Teams:GetChildren()) do
+            if t:IsA("Team") and t.TeamColor == LP.TeamColor then
+                if string.find(string.lower(t.Name), "marine", 1, true) then
+                    DiagState.Faction = "Marines"
+                    return "Marines"
+                elseif string.find(string.lower(t.Name), "pirate", 1, true) then
+                    DiagState.Faction = "Pirates"
+                    return "Pirates"
+                end
+            end
+        end
+    end
+
+    DiagState.Faction = "Unassigned"
+    return nil
+end
+
+local function GetStageForLevel(level, faction, rootPos)
+    local actualFaction = faction or GetPlayerFaction() or Config.DefaultTeam
+    local candidates = {}
+
+    for _, stage in ipairs(Stages) do
+        if level >= stage.MinLevel and level <= stage.MaxLevel then
+            table.insert(candidates, stage)
+        end
+    end
+
+    if #candidates == 0 then
+        return nil
+    end
+    if #candidates == 1 then
+        return candidates[1]
+    end
+
+    if rootPos and IsValidVector3(rootPos) then
+        local closestStage = nil
+        local closestDist = math.huge
+        for _, st in ipairs(candidates) do
+            local d = (rootPos - st.QuestNPC.Position).Magnitude
+            if d < closestDist then
+                closestDist = d
+                closestStage = st
+            end
+        end
+        if closestStage and closestDist <= 1200 then
+            return closestStage
+        end
+    end
+
+    for _, st in ipairs(candidates) do
+        if st.Faction == actualFaction or st.Faction == "Any" then
+            return st
+        end
+    end
+
+    return candidates[1]
+end
+
+-- ================= REMOTE REQUEST MANAGER =================
+
+local CommF = nil
+
+local RemoteManager = {
+    InFlight = {},
+    LastInvokeAt = {},
+    MinIntervals = {
+        StartQuest = 0.8,
+        AbandonQuest = 1.2,
+        AddPoint = 0.8,
+        Buso = 5.0,
+        requestEntrance = 1.0,
+        SetTeam = 2.0
+    }
+}
+
+function RemoteManager:CanInvoke(actionKey)
+    if not Alive or not CommF then
+        return false, "RemoteUnavailable"
+    end
+    if self.InFlight[actionKey] then
+        return false, "InFlight"
+    end
+    local minInt = self.MinIntervals[actionKey] or 0.5
+    local lastAt = self.LastInvokeAt[actionKey] or 0
+    if (os.clock() - lastAt) < minInt then
+        return false, "RateLimited"
+    end
+    return true, "OK"
+end
+
+function RemoteManager:Invoke(actionKey, ...)
+    local canRun, reason = self:CanInvoke(actionKey)
+    if not canRun then
+        return false, nil, reason
+    end
+
+    local args = { ... }
+    local requestEpoch = LifecycleEpoch
+    self.InFlight[actionKey] = true
+    self.LastInvokeAt[actionKey] = os.clock()
+
+    local completed = false
+    local invokeOk = false
+    local invokeResult = nil
+
+    task.spawn(function()
+        invokeOk, invokeResult = xpcall(function()
+            return CommF:InvokeServer(table.unpack(args))
+        end, debug.traceback)
+        completed = true
+    end)
+
+    local deadline = os.clock() + Config.RemoteTimeout
+    while not completed and os.clock() < deadline do
+        if not Alive or requestEpoch ~= LifecycleEpoch then
+            self.InFlight[actionKey] = false
+            return false, nil, "CancelledByEpoch"
+        end
+        task.wait(0.05)
+    end
+
+    self.InFlight[actionKey] = false
+
+    if not completed then
+        RecordError("RemoteTimeout:" .. tostring(actionKey), "Timed out after " .. tostring(Config.RemoteTimeout) .. "s")
+        return false, nil, "Timeout"
+    end
+
+    if requestEpoch ~= LifecycleEpoch then
+        return false, nil, "StaleEpoch"
+    end
+
+    if not invokeOk then
+        RecordError("Remote:" .. tostring(actionKey), invokeResult)
+        return false, nil, tostring(invokeResult)
+    end
+
+    return true, invokeResult, "OK"
+end
+
+-- ================= TINE HUB GUI =================
+
+local GUI = Instance.new("ScreenGui")
+GUI.Name = "TineHub_AutoFarm"
+GUI.ResetOnSpawn = false
+GUI.DisplayOrder = 999
+
+local guiParent = nil
+pcall(function()
+    if typeof(gethui) == "function" then
+        guiParent = gethui()
+    end
+end)
+
+if not guiParent then
+    guiParent = LP:WaitForChild("PlayerGui", 15)
+end
+
+if guiParent then
+    GUI.Parent = guiParent
+end
+
+local Main = Instance.new("Frame")
+Main.Size = UDim2.new(0, 315, 0, 370)
+Main.Position = UDim2.new(0.5, -157, 0.18, 0)
+Main.BackgroundColor3 = Color3.fromRGB(16, 18, 26)
+Main.BorderSizePixel = 0
+Main.Active = true
+Main.Parent = GUI
+
+Instance.new("UICorner", Main).CornerRadius = UDim.new(0, 10)
+
+local Stroke = Instance.new("UIStroke", Main)
+Stroke.Color = Color3.fromRGB(0, 170, 255)
+Stroke.Thickness = 1.5
+
+local Header = Instance.new("Frame")
+Header.Size = UDim2.new(1, 0, 0, 34)
+Header.BackgroundColor3 = Color3.fromRGB(20, 95, 165)
+Header.BorderSizePixel = 0
+Header.Parent = Main
+
+Instance.new("UICorner", Header).CornerRadius = UDim.new(0, 10)
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, -16, 1, 0)
+Title.Position = UDim2.new(0, 8, 0, 0)
+Title.BackgroundTransparency = 1
+Title.Text = "TINE HUB | FIRST SEA AUTO FARM"
+Title.TextColor3 = Color3.new(1, 1, 1)
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 12
+Title.TextXAlignment = Enum.TextXAlignment.Center
+Title.Parent = Header
+
+local function CreateLabel(text, y, color)
+    local obj = Instance.new("TextLabel")
+    obj.Size = UDim2.new(1, -20, 0, 17)
+    obj.Position = UDim2.new(0, 10, 0, y)
+    obj.BackgroundTransparency = 1
+    obj.TextColor3 = color or Color3.fromRGB(230, 235, 245)
+    obj.TextXAlignment = Enum.TextXAlignment.Left
+    obj.Font = Enum.Font.GothamMedium
+    obj.TextSize = 11
+    obj.TextTruncate = Enum.TextTruncate.AtEnd
+    obj.Text = text
+    obj.Parent = Main
+    return obj
+end
+
+local LevelLabel      = CreateLabel("Level: Loading... | Faction: ...", 38)
+local TargetLabel     = CreateLabel("Stage: None | Target: None", 55)
+local ProgressLabel   = CreateLabel("Quest: None (0/0) [QUEST_NOT_STARTED]", 72)
+local StatsLabel      = CreateLabel("Auto Stats: Melee Only", 89)
+local StatusLabel     = CreateLabel("Status: Initializing... | Nav: IDLE", 106)
+local CombatDiagLabel = CreateLabel("Wpn: WEAPON_NOT_FOUND | Cmb: COMBAT_DISABLED", 123, Color3.fromRGB(140, 210, 255))
+local MobDiagLabel    = CreateLabel("Tgt: TARGET_NOT_FOUND | Dist: - | Mobs: 0/0", 140, Color3.fromRGB(180, 220, 180))
+local ErrDiagLabel    = CreateLabel("Err: None", 157, Color3.fromRGB(255, 195, 140))
+
+local function CreateSmallBtn(text, xScale, xOffset, y, wScale)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(wScale or 0.48, -12, 0, 25)
+    btn.Position = UDim2.new(xScale, xOffset, 0, y)
+    btn.BackgroundColor3 = Color3.fromRGB(25, 135, 95)
+    btn.TextColor3 = Color3.new(1, 1, 1)
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 10
+    btn.Text = text
+    btn.Parent = Main
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+    return btn
+end
+
+local FastAtkBtn   = CreateSmallBtn("Fast Attack: ON", 0, 10, 180, 0.48)
+local BringMobBtn  = CreateSmallBtn("Bring Mob: ON", 0.52, 2, 180, 0.48)
+local AutoHakiBtn  = CreateSmallBtn("Auto Haki: ON", 0, 10, 210, 0.48)
+local AutoStatBtn  = CreateSmallBtn("Melee Stats: ON", 0.52, 2, 210, 0.48)
+local SpeedModeBtn = CreateSmallBtn("Tween Speed: 210", 0, 10, 240, 1.0)
+SpeedModeBtn.Size  = UDim2.new(1, -20, 0, 24)
+SpeedModeBtn.BackgroundColor3 = Color3.fromRGB(45, 90, 145)
+
+local Toggle = Instance.new("TextButton")
+Toggle.Size = UDim2.new(1, -20, 0, 30)
+Toggle.Position = UDim2.new(0, 10, 0, 270)
+Toggle.BackgroundColor3 = Color3.fromRGB(30, 150, 85)
+Toggle.TextColor3 = Color3.new(1, 1, 1)
+Toggle.Font = Enum.Font.GothamBold
+Toggle.TextSize = 12
+Toggle.Text = "STOP AUTO FARM"
+Toggle.Parent = Main
+Instance.new("UICorner", Toggle).CornerRadius = UDim.new(0, 6)
+
+local FooterLabel = CreateLabel("TINE HUB | FSM: INITIALIZING | Worker: STARTING", 308, Color3.fromRGB(135, 160, 190))
+local SubFooterLabel = CreateLabel("AtkSent: 0 | PlaceId: " .. tostring(game.PlaceId), 326, Color3.fromRGB(115, 140, 170))
+
+local function SetLabelText(label, newText)
+    if label and label.Parent and label.Text ~= newText then
+        label.Text = newText
+    end
+end
+
+local CurrentStatusMessage = "Initializing..."
+
+local function RefreshDiagnosticsUI()
+    DiagState.FSMState = FSMState
+    DiagState.TargetStage = LockedStage and LockedStage.MobName or "None"
+    DiagState.QuestName = LockedStage and (LockedStage.QuestName .. "#" .. tostring(LockedStage.QuestIndex)) or "None"
+
+    if not Running or not Alive then
+        DiagState.WorkerStatus = "STOPPED"
+    elseif CombatWorkerHeartbeatAt == 0 then
+        DiagState.WorkerStatus = "STARTING"
+    else
+        local workerAge = os.clock() - CombatWorkerHeartbeatAt
+        DiagState.WorkerStatus = (workerAge <= Config.WorkerWatchdogTimeout) and "OK" or "STALLED"
+    end
+
+    SetLabelText(
+        LevelLabel,
+        string.format("Level: %d / %d | Faction: %s", DiagState.Level, Config.MaxFirstSeaLevel, DiagState.Faction)
+    )
+    SetLabelText(
+        TargetLabel,
+        string.format("Stage: %s | Quest: %s", DiagState.TargetStage, DiagState.QuestName)
+    )
+    SetLabelText(
+        StatusLabel,
+        string.format("Status: %s | Nav: %s", tostring(CurrentStatusMessage), DiagState.NavigationStatus)
+    )
+    SetLabelText(
+        CombatDiagLabel,
+        string.format("Wpn: %s | Cmb: %s", DiagState.WeaponStatus, DiagState.CombatStatus)
+    )
+
+    local distStr = (DiagState.TargetDistance >= 0) and string.format("%.1f", DiagState.TargetDistance) or "-"
+    SetLabelText(
+        MobDiagLabel,
+        string.format(
+            "Tgt: %s | Dist: %s | Mobs: %d/%d",
+            DiagState.TargetStatus,
+            distStr,
+            DiagState.MatchingEnemies,
+            DiagState.TotalEnemies
+        )
+    )
+
+    SetLabelText(ErrDiagLabel, "Err: " .. tostring(DiagState.LastError))
+    SetLabelText(
+        FooterLabel,
+        string.format("TINE HUB | FSM: %s | Worker: %s", FSMState, DiagState.WorkerStatus)
+    )
+    SetLabelText(
+        SubFooterLabel,
+        string.format("QStatus: %s | AtkSent: %d", DiagState.QuestStatus, DiagState.AttackCount)
+    )
+end
+
+local function SetStatus(text)
+    CurrentStatusMessage = tostring(text)
+    RefreshDiagnosticsUI()
+end
+
+local function SetProgressText(text)
+    SetLabelText(
+        ProgressLabel,
+        string.format("Quest: %s [%s]", tostring(text), DiagState.QuestStatus)
+    )
+    RefreshDiagnosticsUI()
+end
+
+-- ================= CHARACTER LIFECYCLE & CACHE =================
+
+local function GetCharacter()
+    if CharRef and CharRef.Parent and HumRef and HumRef.Parent and RootRef and RootRef.Parent then
+        if HumRef.Health > 0 then
+            return CharRef, HumRef, RootRef
+        end
+        return nil
+    end
+
+    local char = LP.Character
+    if not char or not char.Parent then
+        CharRef, HumRef, RootRef = nil, nil, nil
+        return nil
+    end
+
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+
+    if hum and root and hum.Health > 0 then
+        CharRef, HumRef, RootRef = char, hum, root
+        return char, hum, root
+    end
+
+    return nil
+end
+
+local function RestoreCharacterCollisions()
+    for part, origCollide in pairs(OriginalCollideState) do
+        if part and part.Parent then
+            pcall(function()
+                part.CanCollide = origCollide
+            end)
+        end
+    end
+end
+
+local function RestoreModifiedMobs()
+    for mob, state in pairs(OriginalMobState) do
+        if mob and mob.Parent then
+            pcall(function()
+                local mr = mob:FindFirstChild("HumanoidRootPart")
+                local mh = mob:FindFirstChildOfClass("Humanoid")
+                if mr and state.CanCollide ~= nil then
+                    mr.CanCollide = state.CanCollide
+                end
+                if mh then
+                    if state.WalkSpeed then mh.WalkSpeed = state.WalkSpeed end
+                    if state.JumpPower then mh.JumpPower = state.JumpPower end
+                end
+            end)
+        end
+        OriginalMobState[mob] = nil
+    end
+end
+
+local function EnableStabilizer(root)
+    if not root or not root.Parent then return end
+    if not StabilizerBV or StabilizerBV.Parent ~= root then
+        if StabilizerBV then
+            pcall(function() StabilizerBV:Destroy() end)
+        end
+        local bv = Instance.new("BodyVelocity")
+        bv.Name = "TineHubStabilizerBV"
+        bv.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+        bv.Velocity = Vector3.zero
+        bv.Parent = root
+        StabilizerBV = bv
+    else
+        StabilizerBV.Velocity = Vector3.zero
+    end
+    pcall(function()
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    end)
+end
+
+local function DisableStabilizer()
+    if StabilizerBV then
+        pcall(function()
+            StabilizerBV:Destroy()
+        end)
+        StabilizerBV = nil
+    end
+end
+
+local function CancelMovement(reason)
+    MoveToken += 1
+    if ActiveTween then
+        pcall(function()
+            ActiveTween:Cancel()
+        end)
+        ActiveTween = nil
+    end
+    if reason then
+        DiagState.NavigationStatus = "MOVEMENT_INTERRUPTED"
+    end
+end
+
+local function RebuildCharacterPartCache(char)
+    table.clear(CachedCharParts)
+
+    local function TrackPart(inst)
+        if inst:IsA("BasePart") then
+            if OriginalCollideState[inst] == nil then
+                OriginalCollideState[inst] = inst.CanCollide
+            end
+            if not table.find(CachedCharParts, inst) then
+                table.insert(CachedCharParts, inst)
+            end
+        end
+    end
+
+    for _, desc in ipairs(char:GetDescendants()) do
+        TrackPart(desc)
+    end
+
+    table.insert(CharConnections, char.DescendantAdded:Connect(TrackPart))
+    table.insert(CharConnections, char.DescendantRemoving:Connect(function(inst)
+        if inst:IsA("BasePart") then
+            local idx = table.find(CachedCharParts, inst)
+            if idx then
+                table.remove(CachedCharParts, idx)
+            end
+        end
+    end))
+end
+
+local function BindCharacterEvents(char, expectedToken)
+    ClearCharConnections()
+    CachedWeapon = nil
+
+    if not char or not char.Parent then
+        return false
+    end
+
+    local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 10)
+    local root = char:FindFirstChild("HumanoidRootPart") or char:WaitForChild("HumanoidRootPart", 10)
+
+    if not Alive or expectedToken ~= RespawnToken or not hum or not root then
+        return false
+    end
+
+    CharRef = char
+    HumRef = hum
+    RootRef = root
+
+    pcall(function()
+        hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+        hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+    end)
+
+    RebuildCharacterPartCache(char)
+
+    table.insert(CharConnections, hum.Died:Connect(function()
+        BumpEpoch()
+        IsRespawning = true
+        RespawnStartedAt = os.clock()
+        CombatTarget = nil
+        CachedWeapon = nil
+        IsAttacking = false
+        DiagState.CombatStatus = "CHARACTER_NOT_READY"
+        DiagState.NavigationStatus = "CHARACTER_MISSING"
+        CancelMovement("CharacterDied")
+        DisableStabilizer()
+        if Running and Alive then
+            SetStatus("Character died, waiting respawn...")
+        end
+    end))
+
+    return true
+end
+
+local function InitRespawnHandler()
+    if LP.Character then
+        RespawnToken += 1
+        BindCharacterEvents(LP.Character, RespawnToken)
+    end
+
+    RegisterGlobalConn(LP.CharacterRemoving:Connect(function()
+        BumpEpoch()
+        IsRespawning = true
+        RespawnStartedAt = os.clock()
+        CombatTarget = nil
+        CachedWeapon = nil
+        IsAttacking = false
+        CharRef, HumRef, RootRef = nil, nil, nil
+        DiagState.CombatStatus = "CHARACTER_NOT_READY"
+        DiagState.NavigationStatus = "CHARACTER_MISSING"
+        CancelMovement("CharacterRemoving")
+        DisableStabilizer()
+        ClearCharConnections()
+    end))
+
+    RegisterGlobalConn(LP.CharacterAdded:Connect(function(newChar)
+        RespawnToken += 1
+        local myRespawnToken = RespawnToken
+        BumpEpoch()
+
+        IsRespawning = true
+        RespawnStartedAt = os.clock()
+        CombatTarget = nil
+        CachedWeapon = nil
+        IsAttacking = false
+        CancelMovement("CharacterAdded")
+        DisableStabilizer()
+
+        local bound = BindCharacterEvents(newChar, myRespawnToken)
+        if myRespawnToken ~= RespawnToken or not Alive then
+            return
+        end
+
+        if not bound then
+            IsRespawning = false
+            RecordError("Respawn", "BindCharacterEvents timed out; watchdog will recover")
+            return
+        end
+
+        task.wait(Config.RespawnSettleDelay)
+        if myRespawnToken ~= RespawnToken or not Alive then
+            return
+        end
+
+        IsRespawning = false
+        NavRetryCount = 0
+
+        if Running then
+            if FSMState ~= "FARMING" then
+                TransitionFSM("CHECKING_TEAM")
+            end
+            SetStatus("Respawned! Resuming...")
+        end
+    end))
+end
+
+-- ================= NAVIGATION SYSTEM =================
+
+local function MoveToCFrame(targetCF, cancelCheck, maxDuration)
+    if not CanContinue() then
+        DiagState.NavigationStatus = "MOVEMENT_INTERRUPTED"
+        return false, "MOVEMENT_INTERRUPTED"
+    end
+    if typeof(targetCF) ~= "CFrame" then
+        DiagState.NavigationStatus = "NAVIGATION_ERROR"
+        return false, "NAVIGATION_ERROR"
+    end
+
+    local char = LP.Character
+    if not char or not char.Parent then
+        DiagState.NavigationStatus = "CHARACTER_MISSING"
+        return false, "CHARACTER_MISSING"
+    end
+
+    local _, _, root = GetCharacter()
+    if not root then
+        DiagState.NavigationStatus = "ROOT_PART_MISSING"
+        return false, "ROOT_PART_MISSING"
+    end
+
+    local cleanCF = IsValidCFrame(targetCF) and targetCF or SafeUprightCF(targetCF.Position)
+    if not cleanCF or not IsValidCFrame(cleanCF) then
+        DiagState.NavigationStatus = "NAVIGATION_ERROR"
+        return false, "NAVIGATION_ERROR"
+    end
+
+    local targetPos = cleanCF.Position
+    local initialDist = (root.Position - targetPos).Magnitude
+    if initialDist <= Config.ArrivalThreshold then
+        CancelMovement()
+        EnableStabilizer(root)
+        if initialDist > 1.2 then
+            root.CFrame = cleanCF
+        end
+        if (root.Position - targetPos).Magnitude <= (Config.ArrivalThreshold + 2.0) then
+            DiagState.NavigationStatus = "ARRIVED"
+            return true, "ARRIVED"
+        end
+    end
+
+    CancelMovement()
+    local myToken = MoveToken
+    local moveEpoch = LifecycleEpoch
+    EnableStabilizer(root)
+    DiagState.NavigationStatus = "NAVIGATING"
+
+    local duration = initialDist / math.max(Config.TweenSpeed, 1)
+    local timeoutDeadline = os.clock() + math.min(duration + 8.0, maxDuration or Config.MaxMoveDuration)
+
+    local tween = TweenService:Create(
+        root,
+        TweenInfo.new(duration, Enum.EasingStyle.Linear),
+        {CFrame = cleanCF}
+    )
+
+    ActiveTween = tween
+    tween:Play()
+
+    local lastProgressPos = root.Position
+    local lastProgressTime = os.clock()
+    local stuckRecoveries = 0
+
+    while tween.PlaybackState == Enum.PlaybackState.Playing do
+        if not CanContinue(moveEpoch) or myToken ~= MoveToken then
+            pcall(function() tween:Cancel() end)
+            if ActiveTween == tween then ActiveTween = nil end
+            DiagState.NavigationStatus = "MOVEMENT_INTERRUPTED"
+            return false, "MOVEMENT_INTERRUPTED"
+        end
+
+        if os.clock() >= timeoutDeadline then
+            pcall(function() tween:Cancel() end)
+            if ActiveTween == tween then ActiveTween = nil end
+            DiagState.NavigationStatus = "MOVEMENT_TIMEOUT"
+            return false, "MOVEMENT_TIMEOUT"
+        end
+
+        local curChar, _, currentRoot = GetCharacter()
+        if not curChar then
+            pcall(function() tween:Cancel() end)
+            if ActiveTween == tween then ActiveTween = nil end
+            DiagState.NavigationStatus = "CHARACTER_MISSING"
+            return false, "CHARACTER_MISSING"
+        end
+        if currentRoot ~= root then
+            pcall(function() tween:Cancel() end)
+            if ActiveTween == tween then ActiveTween = nil end
+            DiagState.NavigationStatus = "ROOT_PART_MISSING"
+            return false, "ROOT_PART_MISSING"
+        end
+
+        EnableStabilizer(root)
+
+        local distNow = (root.Position - targetPos).Magnitude
+        if distNow <= Config.ArrivalThreshold then
+            pcall(function() tween:Cancel() end)
+            if ActiveTween == tween then ActiveTween = nil end
+            root.CFrame = cleanCF
+            if (root.Position - targetPos).Magnitude <= (Config.ArrivalThreshold + 2.0) then
+                DiagState.NavigationStatus = "ARRIVED"
+                return true, "ARRIVED"
+            end
+        end
+
+        if cancelCheck and cancelCheck() then
+            pcall(function() tween:Cancel() end)
+            if ActiveTween == tween then ActiveTween = nil end
+            DiagState.NavigationStatus = "MOVEMENT_INTERRUPTED"
+            return false, "MOVEMENT_INTERRUPTED"
+        end
+
+        local now = os.clock()
+        if (root.Position - lastProgressPos).Magnitude >= Config.StuckMinMoveDist then
+            lastProgressPos = root.Position
+            lastProgressTime = now
+        elseif (now - lastProgressTime) >= Config.StuckCheckInterval and distNow > 12.0 then
+            stuckRecoveries += 1
+            pcall(function() tween:Cancel() end)
+            if ActiveTween == tween then ActiveTween = nil end
+
+            if stuckRecoveries >= 2 then
+                DiagState.NavigationStatus = "MOVEMENT_TIMEOUT"
+                return false, "MOVEMENT_TIMEOUT"
+            end
+
+            local nudgeCF = SafeUprightCF(root.Position + Vector3.new(0, 15, 0))
+            if nudgeCF then
+                root.CFrame = nudgeCF
+            end
+            lastProgressPos = root.Position
+            lastProgressTime = os.clock()
+
+            local newDist = (root.Position - targetPos).Magnitude
+            local newDur = newDist / math.max(Config.TweenSpeed, 1)
+            tween = TweenService:Create(
+                root,
+                TweenInfo.new(newDur, Enum.EasingStyle.Linear),
+                {CFrame = cleanCF}
+            )
+            ActiveTween = tween
+            tween:Play()
+        end
+
+        task.wait(0.04)
+    end
+
+    if ActiveTween == tween then
+        ActiveTween = nil
+    end
+
+    if not CanContinue(moveEpoch) or myToken ~= MoveToken then
+        DiagState.NavigationStatus = "MOVEMENT_INTERRUPTED"
+        return false, "MOVEMENT_INTERRUPTED"
+    end
+
+    local _, _, finalRoot = GetCharacter()
+    if not finalRoot then
+        DiagState.NavigationStatus = "ROOT_PART_MISSING"
+        return false, "ROOT_PART_MISSING"
+    end
+
+    local finalDist = (finalRoot.Position - targetPos).Magnitude
+    if finalDist <= (Config.ArrivalThreshold + 4.0) then
+        DiagState.NavigationStatus = "ARRIVED"
+        return true, "ARRIVED"
+    end
+
+    DiagState.NavigationStatus = "MOVEMENT_TIMEOUT"
+    return false, "MOVEMENT_TIMEOUT"
+end
+
+local function NavigateIslandTransition(stage)
+    if not CanContinue() then return false, "MOVEMENT_INTERRUPTED" end
+    local _, _, root = GetCharacter()
+    if not root then return false, "ROOT_PART_MISSING" end
+
+    local questPos = stage.QuestNPC.Position
+    local epoch = LifecycleEpoch
+
+    if root.Position.X > 55000 and questPos.X < 50000 then
+        SetStatus("Exiting Fishman Island...")
+        RemoteManager:Invoke("requestEntrance", FISHMAN_EXIT_TO)
+        task.wait(0.6)
+        if not CanContinue(epoch) then return false, "MOVEMENT_INTERRUPTED" end
+
+        local _, _, checkRoot = GetCharacter()
+        if checkRoot and checkRoot.Position.X > 55000 then
+            MoveToCFrame(CFrame.new(FISHMAN_ENTRANCE_TO), nil, 25.0)
+            task.wait(0.4)
+            if not CanContinue(epoch) then return false, "MOVEMENT_INTERRUPTED" end
+        end
+    end
+
+    if not stage.EntranceFrom or not stage.EntranceTo then
+        return true, "ARRIVED"
+    end
+
+    _, _, root = GetCharacter()
+    if not root then return false, "ROOT_PART_MISSING" end
+
+    if (root.Position - questPos).Magnitude < 2800 then
+        return true, "ARRIVED"
+    end
+
+    SetStatus("Requesting island entrance...")
+    RemoteManager:Invoke("requestEntrance", stage.EntranceTo)
+    task.wait(0.6)
+    if not CanContinue(epoch) then return false, "MOVEMENT_INTERRUPTED" end
+
+    local _, _, afterRoot = GetCharacter()
+    if afterRoot and (afterRoot.Position - questPos).Magnitude < 2800 then
+        return true, "ARRIVED"
+    end
+
+    SetStatus("Navigating to island portal...")
+    local moved, moveStatus = MoveToCFrame(stage.EntranceFrom, nil, 40.0)
+    if not moved or not CanContinue(epoch) then
+        return false, moveStatus
+    end
+
+    local _, _, portalRoot = GetCharacter()
+    if not portalRoot then return false, "ROOT_PART_MISSING" end
+
+    if (portalRoot.Position - stage.EntranceFrom.Position).Magnitude < 80 then
+        RemoteManager:Invoke("requestEntrance", stage.EntranceTo)
+        task.wait(0.8)
+        if not CanContinue(epoch) then return false, "MOVEMENT_INTERRUPTED" end
+    end
+
+    local _, _, finalRoot = GetCharacter()
+    if finalRoot and (finalRoot.Position - questPos).Magnitude < 2800 then
+        return true, "ARRIVED"
+    end
+    return false, "MOVEMENT_TIMEOUT"
+end
+
+local function NavigateToQuestNPC(stage, level)
+    local islandOk, islandReason = NavigateIslandTransition(stage)
+    if not islandOk or not CanContinue() then
+        return false, islandReason
+    end
+
+    DiagState.QuestStatus = "APPROACHING_QUEST_NPC"
+    SetStatus(string.format("Lv %d | Moving to %s", level, stage.QuestName))
+    local questCF = SafeUprightCF(stage.QuestNPC.Position)
+    if not questCF then
+        DiagState.NavigationStatus = "NAVIGATION_ERROR"
+        return false, "NAVIGATION_ERROR"
+    end
+
+    local moved, navReason = MoveToCFrame(questCF, nil, 40.0)
+    if not moved or not CanContinue() then
+        return false, navReason
+    end
+
+    local _, _, root = GetCharacter()
+    if not root then
+        DiagState.NavigationStatus = "ROOT_PART_MISSING"
+        return false, "ROOT_PART_MISSING"
+    end
+
+    local finalDist = (root.Position - questCF.Position).Magnitude
+    if finalDist > 14.0 then
+        DiagState.NavigationStatus = "MOVEMENT_TIMEOUT"
+        return false, "MOVEMENT_TIMEOUT"
+    end
+
+    EnableStabilizer(root)
+    DiagState.NavigationStatus = "ARRIVED"
+    return true, "ARRIVED"
+end
+
+-- ================= NPC DETECTION & BRING MOB =================
+
+local function NameMatches(instanceName, mobName)
+    if typeof(instanceName) ~= "string" or typeof(mobName) ~= "string" then
+        return false
+    end
+
+    local actual = string.lower(string.gsub(instanceName, "^%s*(.-)%s*$", "%1"))
+    local expected = string.lower(string.gsub(mobName, "^%s*(.-)%s*$", "%1"))
+    if actual == expected then
+        return true
+    end
+
+    for _, delimiter in ipairs({" [", " (", " - "}) do
+        local prefix = expected .. delimiter
+        if string.sub(actual, 1, #prefix) == prefix then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function IsMobValid(mob, expectedMobName)
+    if not mob or not mob.Parent or not mob:IsA("Model") then
+        return false, "TARGET_INVALID"
+    end
+
+    if expectedMobName and not NameMatches(mob.Name, expectedMobName) then
+        return false, "NAME_MISMATCH"
+    end
+
+    local blockedUntil = MobBlacklist[mob]
+    if blockedUntil then
+        if os.clock() < blockedUntil then
+            return false, "BLACKLISTED"
+        else
+            MobBlacklist[mob] = nil
+        end
+    end
+
+    local mobHum = mob:FindFirstChildOfClass("Humanoid")
+    local mobRoot = mob:FindFirstChild("HumanoidRootPart")
+
+    if not mobHum or not mobRoot then
+        return false, "TARGET_INVALID"
+    end
+    if mobHum.Health <= 0 then
+        return false, "TARGET_DEAD"
+    end
+
+    return true, "VALID"
+end
+
+local function FindNearestMob(mobName, root)
+    local enemies = workspace:FindFirstChild("Enemies")
+    if not enemies or not root then
+        DiagState.TotalEnemies = 0
+        DiagState.MatchingEnemies = 0
+        DiagState.TargetStatus = "ENEMIES_FOLDER_EMPTY"
+        return nil
+    end
+
+    local children = enemies:GetChildren()
+    DiagState.TotalEnemies = #children
+
+    local nearest = nil
+    local shortest = math.huge
+    local matchCount = 0
+    local deadMatchCount = 0
+    local rootPos = root.Position
+
+    local function scanCandidates(candidates)
+        for _, mob in ipairs(candidates) do
+            if mob:IsA("Model") and NameMatches(mob.Name, mobName) then
+                local valid, reason = IsMobValid(mob, mobName)
+                if valid then
+                    matchCount += 1
+                    local mobRoot = mob:FindFirstChild("HumanoidRootPart")
+                    if mobRoot then
+                        local distance = (rootPos - mobRoot.Position).Magnitude
+                        if distance < shortest then
+                            shortest = distance
+                            nearest = mob
+                        end
+                    end
+                elseif reason == "TARGET_DEAD" then
+                    deadMatchCount += 1
+                end
+            end
+        end
+    end
+
+    scanCandidates(children)
+    if matchCount == 0 then
+        scanCandidates(enemies:GetDescendants())
+    end
+
+    DiagState.MatchingEnemies = matchCount
+
+    if nearest then
+        local mh = nearest:FindFirstChildOfClass("Humanoid")
+        DiagState.SelectedTarget = nearest.Name
+        DiagState.TargetHealth = mh and string.format("%d/%d", math.floor(mh.Health), math.floor(mh.MaxHealth)) or "?"
+        DiagState.TargetDistance = shortest
+        DiagState.TargetStatus = string.format("%s (%s)", nearest.Name, DiagState.TargetHealth)
+    else
+        DiagState.SelectedTarget = "None"
+        DiagState.TargetHealth = "0/0"
+        DiagState.TargetDistance = -1
+        if #children == 0 then
+            DiagState.TargetStatus = "NO_NPCS_STREAMED"
+        elseif deadMatchCount > 0 then
+            DiagState.TargetStatus = "ALL_TARGETS_DEAD_RESPAWNING"
+        else
+            DiagState.TargetStatus = "NO_MATCH_FOR_" .. string.upper(mobName)
+        end
+    end
+
+    return nearest
+end
+
+local function BringNearbyMobs(mobName, targetPos, primaryMob)
+    if not Config.BringMob or not targetPos or not CanContinue() then
+        return
+    end
+
+    local enemies = workspace:FindFirstChild("Enemies")
+    if not enemies then return end
+
+    local targetCF = SafeUprightCF(targetPos)
+    if not targetCF then return end
+
+    local broughtCount = 0
+
+    for _, mob in ipairs(enemies:GetChildren()) do
+        if broughtCount >= Config.MaxBringMobs then
+            break
+        end
+
+        if IsMobValid(mob, mobName) then
+            local mobHum = mob:FindFirstChildOfClass("Humanoid")
+            local mobRoot = mob:FindFirstChild("HumanoidRootPart")
+            if mobHum and mobRoot then
+                local dist = (mobRoot.Position - targetPos).Magnitude
+                if dist <= Config.BringMobRadius then
+                    broughtCount += 1
+                    pcall(function()
+                        if not OriginalMobState[mob] then
+                            OriginalMobState[mob] = {
+                                WalkSpeed = mobHum.WalkSpeed,
+                                JumpPower = mobHum.JumpPower,
+                                CanCollide = mobRoot.CanCollide
+                            }
+                        end
+                        if mob ~= primaryMob and dist > 3.5 then
+                            mobRoot.CFrame = targetCF
+                        end
+                        if mobRoot.CanCollide then
+                            mobRoot.CanCollide = false
+                        end
+                        mobRoot.AssemblyLinearVelocity = Vector3.zero
+                        if mobHum.WalkSpeed ~= 0 then mobHum.WalkSpeed = 0 end
+                        if mobHum.JumpPower ~= 0 then mobHum.JumpPower = 0 end
+                    end)
+                end
+            end
+        end
+    end
+end
+
+-- Prioritizes stage.FallbackSpawn and stage.PatrolPoints FIRST so the character immediately leaves the Quest NPC
+local function GetSpawnNodes(stage)
+    local mobName = stage.MobName
+    local now = os.clock()
+    local cached = SpawnNodesCache[mobName]
+
+    if cached and (now - cached.timestamp) < Config.SpawnCacheTTL and #cached.nodes > 0 then
+        return cached.nodes
+    end
+
+    local nodes = {}
+
+    -- 1. Primary verified FallbackSpawn & PatrolPoints first
+    local primaryFallback = SafeUprightCF(stage.FallbackSpawn.Position + Vector3.new(0, Config.HoverHeight + 5, 0))
+    if primaryFallback then
+        table.insert(nodes, primaryFallback)
+    end
+
+    if stage.PatrolPoints then
+        for _, pt in ipairs(stage.PatrolPoints) do
+            local cf = SafeUprightCF(pt.Position + Vector3.new(0, Config.HoverHeight + 5, 0))
+            if cf then
+                table.insert(nodes, cf)
+            end
+        end
+    end
+
+    -- 2. Additional _WorldOrigin.EnemySpawns markers
+    local origin = workspace:FindFirstChild("_WorldOrigin")
+    local spawns = origin and origin:FindFirstChild("EnemySpawns")
+
+    if spawns then
+        for _, sp in ipairs(spawns:GetChildren()) do
+            if NameMatches(sp.Name, mobName) then
+                local part = sp:IsA("BasePart") and sp
+                    or sp:FindFirstChildWhichIsA("BasePart", true)
+                if part then
+                    local cf = SafeUprightCF(part.Position + Vector3.new(0, Config.HoverHeight + 5, 0))
+                    if cf then
+                        table.insert(nodes, cf)
+                    end
+                end
+            end
+        end
+    end
+
+    SpawnNodesCache[mobName] = {
+        timestamp = now,
+        nodes = nodes
+    }
+
+    return nodes
+end
+
+local function PatrolSpawnNodes(stage)
+    SetStatus(string.format("Patrolling %s spawns (%d/%d)", stage.MobName, QuestCurrentCount, QuestRequiredCount))
+
+    local nodes = GetSpawnNodes(stage)
+    if #nodes == 0 then return end
+
+    local now = os.clock()
+    if now - LastSpawnPatrolAt > 2.0 then
+        SpawnPatrolIndex = (SpawnPatrolIndex % #nodes) + 1
+        LastSpawnPatrolAt = now
+    end
+
+    local targetNode = nodes[SpawnPatrolIndex] or nodes[1]
+    if targetNode then
+        MoveToCFrame(targetNode, function()
+            local _, _, r = GetCharacter()
+            return not CanContinue() or (r and FindNearestMob(stage.MobName, r) ~= nil)
+        end, 20.0)
+    end
+end
+
+local function PositionAboveMob(stage, mob, root)
+    local mobRoot = mob:FindFirstChild("HumanoidRootPart")
+    local mobHum = mob:FindFirstChildOfClass("Humanoid")
+    if not mobRoot or not mobHum then
+        DiagState.TargetStatus = "TARGET_INVALID"
+        return false
+    end
+
+    local mobPos = mobRoot.Position
+    local hoverCF, hoverPos = BuildCombatHoverCF(mobPos)
+    if not hoverCF or not hoverPos then return false end
+
+    if (root.Position - hoverPos).Magnitude > 16.0 then
+        SetStatus(string.format("Moving to %s (%d/%d)", stage.MobName, QuestCurrentCount, QuestRequiredCount))
+        local arrived, navReason = MoveToCFrame(hoverCF, function()
+            if not CanContinue() then return true end
+            if not IsMobValid(mob, stage.MobName) then return true end
+            local _, _, r = GetCharacter()
+            if r and (r.Position - mobRoot.Position).Magnitude <= 14.0 then
+                return true
+            end
+            return false
+        end, 30.0)
+
+        if not CanContinue() then return false end
+
+        if not arrived and navReason == "MOVEMENT_TIMEOUT" and IsMobValid(mob, stage.MobName) then
+            MobBlacklist[mob] = os.clock() + Config.MobBlacklistDuration
+            CombatTarget = nil
+            return false
+        end
+    end
+
+    local _, _, latestRoot = GetCharacter()
+    if not latestRoot or not IsMobValid(mob, stage.MobName) then
+        return false
+    end
+
+    CancelMovement()
+    EnableStabilizer(latestRoot)
+    DiagState.NavigationStatus = "ARRIVED"
+
+    local latestMobPos = mobRoot.Position
+    local lockCF, _ = BuildCombatHoverCF(latestMobPos)
+    if lockCF and IsValidCFrame(lockCF) then
+        latestRoot.CFrame = lockCF
+    end
+
+    local currentDist = (latestRoot.Position - latestMobPos).Magnitude
+    DiagState.TargetDistance = currentDist
+    DiagState.SelectedTarget = mob.Name
+    DiagState.TargetHealth = string.format("%d/%d", math.floor(mobHum.Health), math.floor(mobHum.MaxHealth))
+    DiagState.TargetStatus = string.format("%s (%s)", mob.Name, DiagState.TargetHealth)
+
+    if currentDist <= Config.AttackRange then
+        BringNearbyMobs(stage.MobName, latestMobPos, mob)
+    end
+
+    return currentDist <= Config.AttackRange
+end
+
+-- ================= STRICT QUEST HUD DETECTOR & SNAPSHOT READER =================
+
+local function IsGuiHierarchyVisible(guiObj)
+    local curr = guiObj
+    while curr and curr ~= LP do
+        if curr:IsA("GuiObject") and not curr.Visible then
+            return false
+        end
+        if curr:IsA("LayerCollector") and not curr.Enabled then
+            return false
+        end
+        curr = curr.Parent
+    end
+    return curr == LP or (curr ~= nil)
+end
+
+local function IsIgnoredQuestLabelText(lowerTxt)
+    if lowerTxt == ""
+        or lowerTxt == "quest"
+        or lowerTxt == "quests"
+        or lowerTxt == "misi"
+        or lowerTxt == "menu"
+        or lowerTxt == "items"
+        or lowerTxt == "stats" then
+        return true
+    end
+    if string.find(lowerTxt, "reward", 1, true)
+        or string.find(lowerTxt, "hadiah", 1, true)
+        or string.find(lowerTxt, "exp", 1, true)
+        or string.find(lowerTxt, "beli", 1, true)
+        or string.find(lowerTxt, "$", 1, true)
+        or string.find(lowerTxt, "abandon", 1, true)
+        or string.find(lowerTxt, "cancel", 1, true)
+        or string.find(lowerTxt, "batal", 1, true) then
+        return true
+    end
+    return false
+end
+
+local function StageMatchesQuestText(rawText, stage)
+    if not rawText or not stage or rawText == "" then return false end
+    local lowerText = string.lower(rawText)
+    local lowerMob = string.lower(stage.MobName)
+
+    if lowerMob == "bandit" then
+        if string.find(lowerText, "desert bandit", 1, true)
+            or string.find(lowerText, "bandit gurun", 1, true)
+            or string.find(lowerText, "snow bandit", 1, true)
+            or string.find(lowerText, "bandit salju", 1, true)
+            or string.find(lowerText, "sky bandit", 1, true)
+            or string.find(lowerText, "bandit langit", 1, true) then
+            return false
+        end
+    elseif lowerMob == "pirate" then
+        if string.find(lowerText, "galley pirate", 1, true)
+            or string.find(lowerText, "bajak laut galley", 1, true)
+            or string.find(lowerText, "bajak laut kapal", 1, true) then
+            return false
+        end
+    elseif lowerMob == "prisoner" then
+        if string.find(lowerText, "dangerous prisoner", 1, true)
+            or string.find(lowerText, "tahanan berbahaya", 1, true)
+            or string.find(lowerText, "narapidana berbahaya", 1, true) then
+            return false
+        end
+    end
+
+    if stage.Aliases then
+        for _, alias in ipairs(stage.Aliases) do
+            if string.find(lowerText, string.lower(alias), 1, true) then
+                return true
+            end
+        end
+    end
+
+    if string.find(lowerText, lowerMob, 1, true) then
+        return true
+    end
+
+    return false
+end
+
+local function FindStageByQuestText(primaryText, rawText)
+    for _, stage in ipairs(StagesBySpecificity) do
+        if StageMatchesQuestText(primaryText, stage) or StageMatchesQuestText(rawText, stage) then
+            return stage
+        end
+    end
+    return nil
+end
+
+-- Checks whether a string looks like a genuine Quest Objective or Progress text (never a menu button!)
+local function IsGenuineQuestObjectiveText(txt)
+    if not txt or txt == "" then return false end
+    local lower = string.lower(string.gsub(txt, "^%s*(.-)%s*$", "%1"))
+    if IsIgnoredQuestLabelText(lower) then
+        return false
+    end
+
+    -- 1. Contains known quest verbs (English / Indonesian)
+    if string.find(lower, "defeat", 1, true)
+        or string.find(lower, "kalahkan", 1, true)
+        or string.find(lower, "kill", 1, true)
+        or string.find(lower, "destroy", 1, true) then
+        return true
+    end
+
+    -- 2. Matches any known First Sea stage mob name or alias
+    if FindStageByQuestText(lower, lower) ~= nil then
+        return true
+    end
+
+    -- 3. Matches a quest kill fraction X/Y where Y <= 25 (e.g. "0/5", "3/8")
+    local c, r = string.match(lower, "^%(?(%d+)%s*/%s*(%d+)%)?$")
+    if c and r then
+        local reqNum = tonumber(r)
+        if reqNum and reqNum >= 1 and reqNum <= 25 then
+            return true
+        end
+    end
+
+    return false
+end
+
+-- Collects all valid objective/progress strings from a candidate Frame
+local function CollectQuestStringsFromFrame(frame)
+    if not frame or not frame.Parent or not IsGuiHierarchyVisible(frame) then
+        return false, "", ""
+    end
+
+    local primaryParts = {}
+    local rawParts = {}
+    local hasObjective = false
+
+    for _, desc in ipairs(frame:GetDescendants()) do
+        if desc:IsA("TextLabel") and IsGuiHierarchyVisible(desc) then
+            local raw = string.gsub(desc.Text or "", "^%s*(.-)%s*$", "%1")
+            local content = ""
+            pcall(function()
+                content = string.gsub(desc.ContentText or "", "^%s*(.-)%s*$", "%1")
+            end)
+            local primary = (content ~= "" and content) or raw
+
+            if primary ~= "" and not IsIgnoredQuestLabelText(string.lower(primary)) then
+                if IsGenuineQuestObjectiveText(primary) or IsGenuineQuestObjectiveText(raw) or desc.Name == "Title" then
+                    hasObjective = true
+                    table.insert(primaryParts, primary)
+                    table.insert(rawParts, raw)
+                end
+            end
+        end
+    end
+
+    if not hasObjective or #primaryParts == 0 then
+        return false, "", ""
+    end
+
+    return true, table.concat(primaryParts, " | "), table.concat(rawParts, " | ")
+end
+
+-- Strict Quest Frame Detector: NEVER caches buttons or empty frames without genuine objective text
+local function ReadQuestTitle()
+    -- 1. Validate existing cached frame
+    if CachedQuestFrame and CachedQuestFrame.Parent and IsGuiHierarchyVisible(CachedQuestFrame) then
+        local ok, pText, rText = CollectQuestStringsFromFrame(CachedQuestFrame)
+        if ok then
+            return true, pText, rText
+        end
+    end
+
+    CachedQuestFrame = nil
+    CachedQuestTitle = nil
+
+    local playerGui = LP:FindFirstChild("PlayerGui")
+    if not playerGui then
+        return false, "", ""
+    end
+
+    for _, screen in ipairs(playerGui:GetChildren()) do
+        if screen:IsA("ScreenGui") and screen.Name ~= "TineHub_AutoFarm" and screen.Enabled then
+            -- Tier 1: Direct child Frame named "Quest"
+            local directQ = screen:FindFirstChild("Quest")
+            if directQ and directQ:IsA("Frame") and IsGuiHierarchyVisible(directQ) then
+                local ok, pText, rText = CollectQuestStringsFromFrame(directQ)
+                if ok then
+                    CachedQuestFrame = directQ
+                    return true, pText, rText
+                end
+            end
+
+            -- Tier 2: Scan descendants for visible "QuestTitle" or any visible Frame containing genuine quest text
+            for _, desc in ipairs(screen:GetDescendants()) do
+                if desc:IsA("Frame") and (desc.Name == "QuestTitle" or desc.Name == "Quest") and IsGuiHierarchyVisible(desc) then
+                    local rootFrame = (desc.Name == "QuestTitle" and desc.Parent and desc.Parent.Parent and desc.Parent.Parent:IsA("Frame") and desc.Parent.Parent)
+                        or desc
+                    local ok, pText, rText = CollectQuestStringsFromFrame(rootFrame)
+                    if ok then
+                        CachedQuestFrame = rootFrame
+                        return true, pText, rText
+                    end
+                elseif desc:IsA("TextLabel") and IsGuiHierarchyVisible(desc) then
+                    local txt = desc.Text or ""
+                    local lower = string.lower(txt)
+                    if (string.find(lower, "kalahkan", 1, true) or string.find(lower, "defeat", 1, true))
+                        and not IsIgnoredQuestLabelText(lower) then
+                        local parentFrame = desc:FindFirstAncestorWhichIsA("Frame")
+                        if parentFrame and IsGuiHierarchyVisible(parentFrame) then
+                            local ok, pText, rText = CollectQuestStringsFromFrame(parentFrame)
+                            if ok then
+                                CachedQuestFrame = parentFrame
+                                return true, pText, rText
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return false, "", ""
+end
+
+local function ParseQuestProgress(primaryText, rawText, stage)
+    local defaultReq = (stage and stage.ExpectedCount) or 8
+
+    local function ExtractNumbers(txt)
+        if not txt or txt == "" then
+            return nil, nil, false, false
+        end
+
+        for c1, r1 in string.gmatch(txt, "(%d+)%s*/%s*(%d+)") do
+            local reqNum = tonumber(r1)
+            local curNum = tonumber(c1) or 0
+            if reqNum and reqNum >= 1 and reqNum <= 25 and curNum <= reqNum then
+                return curNum, reqNum, true, true
+            end
+        end
+
+        local cleaned = string.gsub(string.lower(txt), "lv%.?%s*%d+", "")
+        cleaned = string.gsub(cleaned, "level%s*%d+", "")
+
+        local n = string.match(cleaned, "(%d+)")
+        if n then
+            local reqNum = tonumber(n)
+            if reqNum and reqNum >= 1 and reqNum <= 25 then
+                return 0, reqNum, true, false
+            end
+        end
+
+        return nil, nil, false, false
+    end
+
+    local cur, req, hasExp, hasFrac = ExtractNumbers(rawText)
+    if not hasExp and primaryText ~= rawText then
+        cur, req, hasExp, hasFrac = ExtractNumbers(primaryText)
+    end
+
+    return (cur or 0), (req or defaultReq), hasExp, hasFrac
+end
+
+local function EvaluateQuestStatus(expectedStage)
+    local questVisible, primaryTitle, rawTitle = ReadQuestTitle()
+    if not questVisible then
+        DiagState.QuestStatus = "QUEST_NOT_STARTED"
+        return "QUEST_NOT_STARTED", nil, 0, (expectedStage and expectedStage.ExpectedCount or 8)
+    end
+
+    local cur, req, hasExplicitReq, hasFraction = ParseQuestProgress(primaryTitle, rawTitle, expectedStage)
+    local matchedStage = FindStageByQuestText(primaryTitle, rawTitle)
+
+    if matchedStage then
+        local c, r = ParseQuestProgress(primaryTitle, rawTitle, matchedStage)
+        DiagState.QuestStatus = "QUEST_ACTIVE_MATCHED"
+        return "QUEST_ACTIVE_MATCHED", matchedStage, c, r
+    end
+
+    if expectedStage and hasExplicitReq and LastRequestedStage == expectedStage then
+        if req == expectedStage.ExpectedCount or hasFraction then
+            DiagState.QuestStatus = "QUEST_ACTIVE_MATCHED"
+            return "QUEST_ACTIVE_MATCHED", expectedStage, cur, req
+        end
+    end
+
+    DiagState.QuestStatus = "QUEST_MISMATCHED"
+    return "QUEST_MISMATCHED", nil, cur, req
+end
+
+-- ================= WEAPON VALIDATION & EQUIP =================
+
+local function IsMatchingMeleeTool(tool)
+    if not tool or not tool:IsA("Tool") then
+        return false
+    end
+    local tip = string.lower(tool.ToolTip or "")
+    if KnownMeleeToolTips[tip] then
+        return true
+    end
+    local lowerName = string.lower(tool.Name or "")
+    if KnownMeleeToolNames[lowerName] then
+        return true
+    end
+    return false
+end
+
+local function ValidateAndEquipWeapon(char, hum, autoEquip)
+    if not char or not hum or hum.Health <= 0 then
+        DiagState.WeaponStatus = "CHARACTER_NOT_READY"
+        return nil
+    end
+
+    if CachedWeapon and CachedWeapon.Parent == char and IsMatchingMeleeTool(CachedWeapon) then
+        DiagState.WeaponStatus = CachedWeapon.Name .. " (Equipped)"
+        return CachedWeapon
+    end
+
+    for _, tool in ipairs(char:GetChildren()) do
+        if IsMatchingMeleeTool(tool) then
+            CachedWeapon = tool
+            DiagState.WeaponStatus = tool.Name .. " (Equipped)"
+            return tool
+        end
+    end
+
+    local backpack = LP:FindFirstChild("Backpack")
+    if backpack then
+        for _, tool in ipairs(backpack:GetChildren()) do
+            if IsMatchingMeleeTool(tool) then
+                if not autoEquip then
+                    CachedWeapon = tool
+                    DiagState.WeaponStatus = tool.Name .. " (Ready in Backpack)"
+                    return tool
+                end
+
+                pcall(function()
+                    hum:EquipTool(tool)
+                end)
+                if tool.Parent ~= char then
+                    pcall(function()
+                        tool.Parent = char
+                    end)
+                end
+                if tool.Parent == char then
+                    CachedWeapon = tool
+                    DiagState.WeaponStatus = tool.Name .. " (Equipped)"
+                    return tool
+                else
+                    DiagState.WeaponStatus = tool.Name .. " (EquipPending)"
+                    return nil
+                end
+            end
+        end
+    end
+
+    CachedWeapon = nil
+    DiagState.WeaponStatus = "WEAPON_NOT_FOUND"
+    return nil
+end
+
+-- ================= AUTO STATS (MELEE ONLY) & AUTO HAKI =================
+
+local function ProcessAutoStats()
+    if not Config.AutoStatsMelee or not CanContinue() then
+        return
+    end
+    local now = os.clock()
+    if now < NextStatAt then return end
+    NextStatAt = now + Config.StatInterval
+
+    local data = LP:FindFirstChild("Data")
+    if not data then return end
+
+    local pointsObj = data:FindFirstChild("Points")
+    local statsFolder = data:FindFirstChild("Stats")
+    local meleeStat = statsFolder and statsFolder:FindFirstChild("Melee")
+    local meleeLevel = meleeStat and meleeStat:FindFirstChild("Level")
+
+    local availablePoints = (pointsObj and pointsObj.Value) or 0
+    local currentMeleeLv = (meleeLevel and meleeLevel.Value) or 0
+
+    if meleeLevel then
+        SetLabelText(StatsLabel, string.format("Melee Stat: Lv %d | Pts: %d", currentMeleeLv, availablePoints))
+    else
+        SetLabelText(StatsLabel, string.format("Auto Stats: Melee Only (Pts: %d)", availablePoints))
+    end
+
+    local remainingCap = Config.MaxStatCap - currentMeleeLv
+    local pointsToSpend = math.min(availablePoints, remainingCap)
+
+    if pointsToSpend > 0 then
+        task.spawn(function()
+            RemoteManager:Invoke("AddPoint", Config.AutoStatsTarget, pointsToSpend)
+        end)
+    end
+end
+
+local function EnableHaki(char)
+    if not Config.AutoHaki or not char or not CanContinue() then return end
+    if char:FindFirstChild("HasBuso") or char:GetAttribute("HasBuso") then
+        return
+    end
+
+    local now = os.clock()
+    if now < NextHakiAt then
+        return
+    end
+    NextHakiAt = now + Config.HakiInterval
+
+    task.spawn(function()
+        RemoteManager:Invoke("Buso")
+    end)
+end
+
+-- ================= COMBAT MODULE & DIAGNOSTICS =================
+
+local NetRegisterAttack = nil
+local NetRegisterHit = nil
+local CachedCombatFrameworkTable = nil
+
+local function ResolveCombatDependencies()
+    if not NetRegisterAttack or not NetRegisterHit then
+        pcall(function()
+            local modules = RS:FindFirstChild("Modules")
+            local net = modules and modules:FindFirstChild("Net")
+            if net then
+                NetRegisterAttack = net:FindFirstChild("RE/RegisterAttack")
+                NetRegisterHit = net:FindFirstChild("RE/RegisterHit")
+            end
+        end)
+    end
+
+    if HasGetUpvalues and not CachedCombatFrameworkTable then
+        pcall(function()
+            local ps = LP:FindFirstChild("PlayerScripts")
+            local cfScript = ps and ps:FindFirstChild("CombatFramework")
+            if cfScript then
+                local upvals = GetUpvaluesFn(require(cfScript))
+                if upvals and typeof(upvals[2]) == "table" then
+                    CachedCombatFrameworkTable = upvals[2]
+                end
+            end
+        end)
+    end
+end
+
+ResolveCombatDependencies()
+
+local function GetBladeHits(root, mobName, maxRadius)
+    local targets = {}
+    local enemies = workspace:FindFirstChild("Enemies")
+    if not enemies or not root then return targets end
+
+    local rootPos = root.Position
+    local limit = maxRadius or 55.0
+
+    local function scanCandidates(candidates)
+        for _, mob in ipairs(candidates) do
+            if IsMobValid(mob, mobName) then
+                local mobRoot = mob:FindFirstChild("HumanoidRootPart")
+                local head = mob:FindFirstChild("Head") or mobRoot
+                if mobRoot and head and (rootPos - mobRoot.Position).Magnitude <= limit then
+                    table.insert(targets, {mob, head})
+                end
+            end
+        end
+    end
+
+    scanCandidates(enemies:GetChildren())
+    if #targets == 0 then
+        scanCandidates(enemies:GetDescendants())
+    end
+
+    return targets
+end
+
+local function FireAttackOnce(char, root, weapon, mobName)
+    if not CanContinue() or FSMState ~= "FARMING" then
+        DiagState.CombatStatus = "COMBAT_DISABLED"
+        return false
+    end
+    if not char or not root then
+        DiagState.CombatStatus = "CHARACTER_NOT_READY"
+        return false
+    end
+    if not weapon or weapon.Parent ~= char then
+        DiagState.CombatStatus = "WEAPON_NOT_FOUND"
+        return false
+    end
+    if IsAttacking then
+        return false
+    end
+
+    local interval = (Config.FastAttack and Config.FastAttackInterval) or Config.NormalAttackInterval or 0.28
+    local now = os.clock()
+    if now < NextAttackAt then
+        DiagState.CombatStatus = "ATTACK_READY"
+        return false
+    end
+
+    IsAttacking = true
+    NextAttackAt = now + interval
+
+    local attackInputAttempted = false
+    local ok, err = xpcall(function()
+        local activateOk = pcall(function()
+            weapon:Activate()
+        end)
+        attackInputAttempted = attackInputAttempted or activateOk
+
+        local vpCenter = Vector2.new(640, 360)
+        local cam = workspace.CurrentCamera
+        if cam then
+            local vs = cam.ViewportSize
+            if vs.X > 0 and vs.Y > 0 then
+                vpCenter = Vector2.new(vs.X * 0.5, vs.Y * 0.5)
+            end
+        end
+
+        if VIM then
+            local inputOk = pcall(function()
+                VIM:SendMouseButtonEvent(vpCenter.X, vpCenter.Y, 0, true, game, 0)
+                VIM:SendMouseButtonEvent(vpCenter.X, vpCenter.Y, 0, false, game, 0)
+            end)
+            attackInputAttempted = attackInputAttempted or inputOk
+        end
+
+        local virtualUserOk = pcall(function()
+            VU:CaptureController()
+            VU:Button1Down(vpCenter)
+            VU:Button1Up(vpCenter)
+        end)
+        attackInputAttempted = attackInputAttempted or virtualUserOk
+
+        if Config.FastAttack then
+            if not NetRegisterAttack or not NetRegisterHit then
+                ResolveCombatDependencies()
+            end
+            if NetRegisterAttack and NetRegisterHit and root then
+                pcall(function()
+                    local hits = GetBladeHits(root, mobName, 55.0)
+                    if #hits > 0 then
+                        NetRegisterAttack:FireServer(0)
+                        NetRegisterHit:FireServer(hits[1][2], hits)
+                        attackInputAttempted = true
+                    end
+                end)
+            end
+
+            if CachedCombatFrameworkTable then
+                pcall(function()
+                    local activeController = CachedCombatFrameworkTable.activeController
+                    if activeController and activeController.blades and #activeController.blades > 0 then
+                        activeController.timeToNextAttack = 0
+                        activeController.hitboxMagnitude = 55
+                        if typeof(activeController.attack) == "function" then
+                            activeController:attack()
+                            attackInputAttempted = true
+                        end
+                    end
+                end)
+            end
+        end
+    end, debug.traceback)
+
+    IsAttacking = false
+
+    if not ok then
+        DiagState.CombatStatus = "COMBAT_ERROR"
+        RecordError("FireAttackOnce", err)
+        return false
+    end
+
+    if not attackInputAttempted then
+        DiagState.CombatStatus = "COMBAT_ERROR"
+        return false
+    end
+
+    DiagState.AttackCount += 1
+    DiagState.CombatStatus = "ATTACK_READY"
+    return true
+end
+
+-- ================= SELF-HEALING COMBAT WORKER =================
+
+local function SpawnCombatWorker()
+    CombatWorkerId += 1
+    local myWorkerId = CombatWorkerId
+    CombatWorkerHeartbeatAt = os.clock()
+
+    task.spawn(function()
+        while Alive and myWorkerId == CombatWorkerId do
+            CombatWorkerHeartbeatAt = os.clock()
+            local interval = (Config.FastAttack and Config.FastAttackInterval) or Config.NormalAttackInterval or 0.28
+            task.wait(interval)
+            CombatWorkerHeartbeatAt = os.clock()
+
+            if CanContinue() and FSMState == "FARMING" and LockedStage then
+                local ok, err = xpcall(function()
+                    local char, hum, root = GetCharacter()
+                    if not char or not hum or not root then
+                        DiagState.CombatStatus = "CHARACTER_NOT_READY"
+                        return
+                    end
+
+                    local target = CombatTarget
+                    local valid, reason = IsMobValid(target, LockedStage.MobName)
+                    if not valid then
+                        if target ~= nil and reason == "TARGET_INVALID" then
+                            DiagState.CombatStatus = "TARGET_INVALID"
+                        else
+                            DiagState.CombatStatus = "TARGET_NOT_FOUND"
+                        end
+                        return
+                    end
+
+                    local mobRoot = target:FindFirstChild("HumanoidRootPart")
+                    if not mobRoot then
+                        DiagState.CombatStatus = "TARGET_INVALID"
+                        return
+                    end
+
+                    local dist = (root.Position - mobRoot.Position).Magnitude
+                    DiagState.TargetDistance = dist
+                    if dist > Config.AttackRange then
+                        DiagState.CombatStatus = "TARGET_NOT_FOUND"
+                        return
+                    end
+
+                    local weapon = ValidateAndEquipWeapon(char, hum, true)
+                    if not weapon then
+                        DiagState.CombatStatus = "WEAPON_NOT_FOUND"
+                        return
+                    end
+
+                    FireAttackOnce(char, root, weapon, LockedStage.MobName)
+                end, debug.traceback)
+
+                if not ok then
+                    IsAttacking = false
+                    DiagState.CombatStatus = "COMBAT_ERROR"
+                    RecordError("CombatWorker", err)
+                end
+            else
+                if not Running or FSMState ~= "FARMING" then
+                    DiagState.CombatStatus = "COMBAT_DISABLED"
+                end
+            end
+        end
+    end)
+end
+
+-- ================= UI CONTROL & RUNNING STATE =================
+
+local function EnterFarmingState(stage, curKills, reqKills, uiConfirmed)
+    LockedStage = stage
+    QuestCurrentCount = curKills or 0
+    QuestRequiredCount = (reqKills and reqKills > 0 and reqKills) or stage.ExpectedCount
+    LocalSessionKills = 0
+    UIQuestConfirmedThisCycle = (uiConfirmed == true)
+    FarmingStartedAt = os.clock()
+    QuestAttemptCount = 0
+    NavRetryCount = 0
+    CombatTarget = nil
+    DiagState.QuestStatus = "QUEST_ACTIVE_MATCHED"
+    SetProgressText(string.format("%s (%d/%d)", LockedStage.MobName, QuestCurrentCount, QuestRequiredCount))
+    SetStatus(string.format("Farming %s (%d/%d)", LockedStage.MobName, QuestCurrentCount, QuestRequiredCount))
+    TransitionFSM("FARMING")
+end
+
+local function ResetQuestFSM(targetState)
+    TransitionFSM(targetState or "CHECKING_TEAM")
+    LockedStage = nil
+    LastStartQuestAt = 0
+    CombatTarget = nil
+    QuestCurrentCount = 0
+    QuestRequiredCount = 0
+    LocalSessionKills = 0
+    UIQuestConfirmedThisCycle = false
+    FarmingStartedAt = 0
+    QuestVerifyDeadline = 0
+    QuestCompletionStartedAt = 0
+    QuestAttemptCount = 0
+    QuestNextAttempt = 0
+    NavRetryCount = 0
+    DiagState.QuestStatus = "QUEST_NOT_STARTED"
+    SetProgressText("None (0/0)")
+end
+
+local function SetRunning(state, customReason)
+    Running = state
+    BumpEpoch()
+
+    SetLabelText(Toggle, state and "STOP AUTO FARM" or "START AUTO FARM")
+    Toggle.BackgroundColor3 = state
+        and Color3.fromRGB(30, 150, 85)
+        or Color3.fromRGB(175, 45, 50)
+
+    if not state then
+        CombatTarget = nil
+        IsAttacking = false
+        DiagState.CombatStatus = "COMBAT_DISABLED"
+        CancelMovement("UserStopped")
+        DisableStabilizer()
+        RestoreCharacterCollisions()
+        RestoreModifiedMobs()
+        TransitionFSM("IDLE")
+        SetStatus(customReason or "Stopped")
+    else
+        CombatTarget = nil
+        IsAttacking = false
+        ResetQuestFSM("CHECKING_TEAM")
+        SetStatus(customReason or "Resuming...")
+    end
+end
+
+-- ================= MAIN STATE MACHINE STEP =================
+
+local function Step()
+    if not Alive or not Running then
+        return
+    end
+
+    -- Self-Healing Combat Worker Watchdog
+    if (os.clock() - CombatWorkerHeartbeatAt) > Config.WorkerWatchdogTimeout then
+        IsAttacking = false
+        RecordError("Watchdog", "Combat worker stalled; restarting worker")
+        SpawnCombatWorker()
+    end
+
+    -- Respawn Watchdog Recovery
+    if IsRespawning then
+        if (os.clock() - RespawnStartedAt) >= Config.RespawnMaxWait and LP.Character then
+            local c = LP.Character
+            local h = c:FindFirstChildOfClass("Humanoid")
+            local r = c:FindFirstChild("HumanoidRootPart")
+            if h and r and h.Health > 0 then
+                RespawnToken += 1
+                BindCharacterEvents(c, RespawnToken)
+                IsRespawning = false
+            end
+        end
+        if IsRespawning then
+            DiagState.CombatStatus = "CHARACTER_NOT_READY"
+            SetStatus("Waiting respawn...")
+            return
+        end
+    end
+
+    local level = LP.Data.Level.Value
+    DiagState.Level = level
+    local currentFaction = GetPlayerFaction()
+
+    ProcessAutoStats()
+
+    if level >= Config.MaxFirstSeaLevel then
+        TransitionFSM("COMPLETED")
+        SetRunning(false, "Level 700 reached! First Sea Completed.")
+        return
+    end
+
+    local char, hum, root = GetCharacter()
+    if not root then
+        CombatTarget = nil
+        DisableStabilizer()
+        DiagState.CombatStatus = "CHARACTER_NOT_READY"
+        DiagState.NavigationStatus = "CHARACTER_MISSING"
+        SetStatus("Waiting character...")
+        return
+    end
+
+    ValidateAndEquipWeapon(char, hum, FSMState == "FARMING")
+
+    local stepEpoch = LifecycleEpoch
+
+    -- =========================================================================
+    -- STATE 1: INITIALIZING / IDLE -> CHECKING_TEAM
+    -- =========================================================================
+    if FSMState == "INITIALIZING" or FSMState == "IDLE" then
+        TransitionFSM("CHECKING_TEAM")
+    end
+
+    -- =========================================================================
+    -- STATE 2: CHECKING_TEAM (Verify Actual Player Faction)
+    -- =========================================================================
+    if FSMState == "CHECKING_TEAM" then
+        CombatTarget = nil
+        currentFaction = GetPlayerFaction()
+        if not currentFaction then
+            SetStatus("Selecting faction: " .. Config.DefaultTeam)
+            RemoteManager:Invoke("SetTeam", Config.DefaultTeam)
+            task.wait(0.4)
+            if not CanContinue(stepEpoch) then return end
+            currentFaction = GetPlayerFaction() or Config.DefaultTeam
+        end
+        TransitionFSM("SELECTING_QUEST")
+    end
+
+    -- =========================================================================
+    -- STATE 3: SELECTING_QUEST (Select Stage by Level, Faction, Proximity & HUD)
+    -- =========================================================================
+    if FSMState == "SELECTING_QUEST" then
+        CombatTarget = nil
+        local desiredStage = GetStageForLevel(level, currentFaction, root.Position)
+        if not desiredStage then
+            TransitionFSM("ERROR")
+            RecordError("SelectQuest", "No stage found for Lv " .. tostring(level))
+            SetStatus("No stage for Lv " .. tostring(level))
+            return
+        end
+
+        local qStatus, matchedStage, curKills, reqKills = EvaluateQuestStatus(desiredStage)
+
+        if qStatus == "QUEST_ACTIVE_MATCHED" and matchedStage then
+            EnterFarmingState(matchedStage, curKills, reqKills, true)
+            return
+        elseif qStatus == "QUEST_MISMATCHED" then
+            LockedStage = desiredStage
+            RecoveryReason = "QUEST_MISMATCHED"
+            RecoveryStartedAt = os.clock()
+            TransitionFSM("RECOVERING")
+            SetStatus("Clearing mismatched quest...")
+            return
+        end
+
+        LockedStage = desiredStage
+        QuestCurrentCount = 0
+        QuestRequiredCount = desiredStage.ExpectedCount
+        QuestAttemptCount = 0
+        NavRetryCount = 0
+        DiagState.QuestStatus = "QUEST_NOT_STARTED"
+        SetProgressText("Taking Quest...")
+        TransitionFSM("TAKING_QUEST")
+        return
+    end
+
+    -- =========================================================================
+    -- STATE 4: RECOVERING (Handle Mismatched Pre-Existing Quests or Nav Retries)
+    -- =========================================================================
+    if FSMState == "RECOVERING" then
+        CombatTarget = nil
+        local qStatus, matchedStage, curKills, reqKills = EvaluateQuestStatus(LockedStage or GetStageForLevel(level, currentFaction, root.Position))
+
+        if qStatus == "QUEST_ACTIVE_MATCHED" and matchedStage then
+            EnterFarmingState(matchedStage, curKills, reqKills, true)
+            return
+        end
+
+        if RecoveryReason == "NAVIGATION_FAILED" then
+            if NavRetryCount >= Config.MaxNavRetries then
+                NavRetryCount = 0
+                LockedStage = GetStageForLevel(level, currentFaction, root.Position) or LockedStage
+                if LockedStage then
+                    pcall(function()
+                        LP:RequestStreamAroundAsync(LockedStage.QuestNPC.Position)
+                    end)
+                end
+            end
+            task.wait(0.5)
+            if not CanContinue(stepEpoch) then return end
+            TransitionFSM("SELECTING_QUEST")
+            return
+        end
+
+        if qStatus == "QUEST_NOT_STARTED" then
+            TransitionFSM("SELECTING_QUEST")
+            return
+        end
+
+        if (os.clock() - RecoveryStartedAt) < Config.QuestLateUIGrace then
+            SetStatus("Checking active quest...")
+            return
+        end
+
+        DiagState.QuestStatus = "QUEST_MISMATCHED"
+        SetStatus("Abandoning mismatched quest...")
+        RemoteManager:Invoke("AbandonQuest")
+        LastRequestedStage = nil
+        LastStartQuestAt = 0
+        CachedQuestFrame = nil
+        CachedQuestTitle = nil
+        task.wait(0.4)
+        if not CanContinue(stepEpoch) then return end
+        TransitionFSM("SELECTING_QUEST")
+        return
+    end
+
+    if not LockedStage then
+        ResetQuestFSM("SELECTING_QUEST")
+        return
+    end
+
+    -- =========================================================================
+    -- STATE 5: TAKING_QUEST (Navigate to Quest NPC & Request Quest)
+    -- =========================================================================
+    if FSMState == "TAKING_QUEST" then
+        CombatTarget = nil
+        local qStatus, matchedStage, curKills, reqKills = EvaluateQuestStatus(LockedStage)
+
+        if qStatus == "QUEST_ACTIVE_MATCHED" and matchedStage then
+            EnterFarmingState(matchedStage, curKills, reqKills, true)
+            return
+        end
+
+        local latestStage = GetStageForLevel(level, currentFaction, root.Position)
+        if latestStage and latestStage ~= LockedStage then
+            LockedStage = latestStage
+            QuestRequiredCount = LockedStage.ExpectedCount
+            QuestAttemptCount = 0
+        end
+
+        local now = os.clock()
+        if now < QuestNextAttempt then
+            DiagState.QuestStatus = "QUEST_RETRY_NEEDED"
+            SetStatus(string.format("Quest cooldown %.1fs...", QuestNextAttempt - now))
+            return
+        end
+
+        local navOk, navReason = NavigateToQuestNPC(LockedStage, level)
+        if not navOk or not CanContinue(stepEpoch) then
+            NavRetryCount += 1
+            if NavRetryCount >= Config.MaxNavRetries then
+                RecoveryReason = "NAVIGATION_FAILED"
+                RecoveryStartedAt = os.clock()
+                TransitionFSM("RECOVERING")
+            else
+                SetStatus("Nav retry (" .. tostring(navReason) .. ")...")
+            end
+            return
+        end
+
+        NavRetryCount = 0
+        task.wait(Config.QuestSettleDelay)
+        if not CanContinue(stepEpoch) then
+            return
+        end
+
+        DiagState.QuestStatus = "REQUESTING_QUEST"
+        SetStatus("Lv " .. level .. " | Requesting Quest: " .. LockedStage.MobName)
+        LastRequestedStage = LockedStage
+
+        local invoked = RemoteManager:Invoke("StartQuest", LockedStage.QuestName, LockedStage.QuestIndex)
+        if not CanContinue(stepEpoch) then
+            return
+        end
+
+        QuestAttemptCount += 1
+        QuestNextAttempt = os.clock() + Config.QuestRetryDelay
+
+        if invoked then
+            LastStartQuestAt = os.clock()
+            QuestVerifyDeadline = os.clock() + Config.QuestVerifyTimeout
+            TransitionFSM("VERIFYING_QUEST")
+            return
+        end
+
+        if QuestAttemptCount >= Config.QuestMaxTries then
+            -- If StartQuest failed/timed out repeatedly while standing at the NPC, check if quest is already active
+            EnterFarmingState(LockedStage, 0, LockedStage.ExpectedCount, false)
+        end
+        return
+    end
+
+    -- =========================================================================
+    -- STATE 6: VERIFYING_QUEST (Confirm Quest UI OR Advance to Farming)
+    -- =========================================================================
+    if FSMState == "VERIFYING_QUEST" then
+        CombatTarget = nil
+        local qStatus, matchedStage, curKills, reqKills = EvaluateQuestStatus(LockedStage)
+
+        if qStatus == "QUEST_ACTIVE_MATCHED" then
+            EnterFarmingState(matchedStage or LockedStage, curKills, reqKills, true)
+            return
+        end
+
+        -- Never freeze at the Quest NPC! Once StartQuest succeeded at the NPC and QuestVerifyTimeout (1.0s)
+        -- has elapsed, advance directly to FARMING using Hybrid UI + Kill Tracking.
+        if os.clock() >= QuestVerifyDeadline then
+            EnterFarmingState(LockedStage, 0, LockedStage.ExpectedCount, (qStatus ~= "QUEST_NOT_STARTED"))
+            return
+        end
+
+        SetStatus("Verifying quest active...")
+        return
+    end
+
+    -- =========================================================================
+    -- STATE 7: FARMING (Farm Validated Stage Mobs & Track Hybrid Progress)
+    -- =========================================================================
+    if FSMState == "FARMING" then
+        local qStatus, matchedStage, curKills, reqKills = EvaluateQuestStatus(LockedStage)
+
+        if qStatus == "QUEST_ACTIVE_MATCHED" then
+            UIQuestConfirmedThisCycle = true
+            if matchedStage and matchedStage ~= LockedStage then
+                LockedStage = matchedStage
+            end
+            QuestCurrentCount = math.max(curKills or 0, LocalSessionKills)
+            if reqKills and reqKills > 0 then
+                QuestRequiredCount = reqKills
+            end
+        elseif qStatus == "QUEST_NOT_STARTED" then
+            if UIQuestConfirmedThisCycle then
+                -- UI was previously confirmed visible and now closed -> quest completed!
+                CombatTarget = nil
+                RestoreModifiedMobs()
+                DiagState.QuestStatus = "QUEST_COMPLETED"
+                QuestCompletionStartedAt = os.clock()
+                TransitionFSM("COMPLETED")
+                SetStatus("Verifying quest completion...")
+                return
+            else
+                -- Hybrid Kill-Counter Mode (when UI frame is custom/hidden):
+                -- Track actual killed target mobs and only complete once all ExpectedCount targets are defeated!
+                QuestCurrentCount = LocalSessionKills
+                if QuestRequiredCount <= 0 then
+                    QuestRequiredCount = LockedStage.ExpectedCount
+                end
+                if QuestCurrentCount >= QuestRequiredCount then
+                    CombatTarget = nil
+                    RestoreModifiedMobs()
+                    DiagState.QuestStatus = "QUEST_COMPLETED"
+                    QuestCompletionStartedAt = os.clock()
+                    TransitionFSM("COMPLETED")
+                    SetStatus("All target NPCs defeated! Completing...")
+                    return
+                end
+            end
+        end
+
+        SetProgressText(string.format("%s (%d/%d)", LockedStage.MobName, QuestCurrentCount, QuestRequiredCount))
+
+        local islandOk = NavigateIslandTransition(LockedStage)
+        if not islandOk or not CanContinue(stepEpoch) then
+            return
+        end
+
+        char, hum, root = GetCharacter()
+        if not root then return end
+
+        EnableHaki(char)
+        local weapon = ValidateAndEquipWeapon(char, hum, true)
+
+        if not IsMobValid(CombatTarget, LockedStage.MobName) then
+            CombatTarget = FindNearestMob(LockedStage.MobName, root)
+        end
+
+        if not CombatTarget then
+            DiagState.CombatStatus = "TARGET_NOT_FOUND"
+            PatrolSpawnNodes(LockedStage)
+            return
+        end
+
+        local inAttackRange = PositionAboveMob(LockedStage, CombatTarget, root)
+        if inAttackRange then
+            char, hum, root = GetCharacter()
+            if char and hum and root then
+                weapon = ValidateAndEquipWeapon(char, hum, true)
+                if weapon then
+                    FireAttackOnce(char, root, weapon, LockedStage.MobName)
+                    SetStatus(string.format("Lv %d | Farming %s (%d/%d)", level, LockedStage.MobName, QuestCurrentCount, QuestRequiredCount))
+                else
+                    DiagState.CombatStatus = "WEAPON_NOT_FOUND"
+                    SetStatus("Weapon not found: " .. Config.WeaponType)
+                end
+            end
+        end
+        return
+    end
+
+    -- =========================================================================
+    -- STATE 8: COMPLETED (Confirm Quest Finished Before Returning to Select Next)
+    -- =========================================================================
+    if FSMState == "COMPLETED" then
+        CombatTarget = nil
+        local qStatus, _, curKills, _ = EvaluateQuestStatus(LockedStage)
+
+        if UIQuestConfirmedThisCycle and qStatus == "QUEST_ACTIVE_MATCHED" then
+            QuestCurrentCount = curKills or QuestCurrentCount
+            TransitionFSM("FARMING")
+            return
+        end
+
+        if (os.clock() - QuestCompletionStartedAt) < Config.QuestCompleteDelay then
+            DiagState.QuestStatus = "QUEST_COMPLETED"
+            SetProgressText(string.format("Completed! (%d/%d)", QuestRequiredCount, QuestRequiredCount))
+            SetStatus("Quest finished! Selecting next...")
+            return
+        end
+
+        LastRequestedStage = nil
+        ResetQuestFSM("CHECKING_TEAM")
+        return
+    end
+
+    -- =========================================================================
+    -- STATE 9: ERROR (Recoverable Fault State)
+    -- =========================================================================
+    if FSMState == "ERROR" then
+        task.wait(1.0)
+        if not CanContinue(stepEpoch) then return end
+        ResetQuestFSM("CHECKING_TEAM")
+    end
+end
+
+-- ================= BACKGROUND SERVICES & HYBRID KILL MONITOR =================
+
+local function StartBackgroundServices()
+    RegisterGlobalConn(RunService.Stepped:Connect(function()
+        if not CanContinue() then return end
+        for i = 1, #CachedCharParts do
+            local part = CachedCharParts[i]
+            if part and part.Parent and part.CanCollide then
+                part.CanCollide = false
+            end
+        end
+    end))
+
+    RegisterGlobalConn(RunService.Heartbeat:Connect(function()
+        if not CanContinue() then return end
+        local now = os.clock()
+
+        if HasSetHiddenProperty and now >= NextSimRadiusAt then
+            NextSimRadiusAt = now + 0.50
+            pcall(function()
+                sethiddenproperty(LP, "SimulationRadius", math.huge)
+            end)
+        end
+
+        -- Authoritative NPC Death Counter for Hybrid Progression
+        if FSMState == "FARMING" and LockedStage then
+            local _, _, root = GetCharacter()
+            local enemies = workspace:FindFirstChild("Enemies")
+            if root and enemies then
+                for _, mob in ipairs(enemies:GetChildren()) do
+                    if not CountedDeadMobs[mob] and mob:IsA("Model") and NameMatches(mob.Name, LockedStage.MobName) then
+                        local mh = mob:FindFirstChildOfClass("Humanoid")
+                        local mr = mob:FindFirstChild("HumanoidRootPart")
+                        if mh and mr and mh.Health <= 0 then
+                            if (root.Position - mr.Position).Magnitude <= 75.0 then
+                                CountedDeadMobs[mob] = true
+                                LocalSessionKills += 1
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end))
+
+    SpawnCombatWorker()
+end
+
+-- ================= GUI INTERACTION & IDEMPOTENT CLEANUP =================
+
+RegisterGlobalConn(Toggle.MouseButton1Click:Connect(function()
+    SetRunning(not Running)
+end))
+
+RegisterGlobalConn(FastAtkBtn.MouseButton1Click:Connect(function()
+    Config.FastAttack = not Config.FastAttack
+    SetLabelText(FastAtkBtn, Config.FastAttack and "Fast Attack: ON" or "Fast Attack: OFF")
+    FastAtkBtn.BackgroundColor3 = Config.FastAttack
+        and Color3.fromRGB(25, 135, 95)
+        or Color3.fromRGB(80, 85, 105)
+end))
+
+RegisterGlobalConn(BringMobBtn.MouseButton1Click:Connect(function()
+    Config.BringMob = not Config.BringMob
+    SetLabelText(BringMobBtn, Config.BringMob and "Bring Mob: ON" or "Bring Mob: OFF")
+    BringMobBtn.BackgroundColor3 = Config.BringMob
+        and Color3.fromRGB(25, 135, 95)
+        or Color3.fromRGB(80, 85, 105)
+    if not Config.BringMob then
+        RestoreModifiedMobs()
+    end
+end))
+
+RegisterGlobalConn(AutoHakiBtn.MouseButton1Click:Connect(function()
+    Config.AutoHaki = not Config.AutoHaki
+    SetLabelText(AutoHakiBtn, Config.AutoHaki and "Auto Haki: ON" or "Auto Haki: OFF")
+    AutoHakiBtn.BackgroundColor3 = Config.AutoHaki
+        and Color3.fromRGB(25, 135, 95)
+        or Color3.fromRGB(80, 85, 105)
+end))
+
+RegisterGlobalConn(AutoStatBtn.MouseButton1Click:Connect(function()
+    Config.AutoStatsMelee = not Config.AutoStatsMelee
+    SetLabelText(AutoStatBtn, Config.AutoStatsMelee and "Melee Stats: ON" or "Melee Stats: OFF")
+    AutoStatBtn.BackgroundColor3 = Config.AutoStatsMelee
+        and Color3.fromRGB(25, 135, 95)
+        or Color3.fromRGB(80, 85, 105)
+end))
+
+RegisterGlobalConn(SpeedModeBtn.MouseButton1Click:Connect(function()
+    Config.TweenSpeedIndex = (Config.TweenSpeedIndex % #Config.TweenSpeedPresets) + 1
+    Config.TweenSpeed = Config.TweenSpeedPresets[Config.TweenSpeedIndex]
+    SetLabelText(SpeedModeBtn, "Tween Speed: " .. tostring(Config.TweenSpeed))
+end))
+
+local dragging = false
+local activeDragInput = nil
+local dragStart = nil
+local startPosition = nil
+
+RegisterGlobalConn(Header.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch
+        or input.UserInputType == Enum.UserInputType.MouseButton1 then
+
+        dragging = true
+        activeDragInput = input
+        dragStart = input.Position
+        startPosition = Main.Position
+    end
+end))
+
+RegisterGlobalConn(UIS.InputChanged:Connect(function(input)
+    if dragging and dragStart and startPosition and (
+        input.UserInputType == Enum.UserInputType.Touch
+        or input.UserInputType == Enum.UserInputType.MouseMovement
+    ) then
+        local delta = input.Position - dragStart
+        Main.Position = UDim2.new(
+            startPosition.X.Scale,
+            startPosition.X.Offset + delta.X,
+            startPosition.Y.Scale,
+            startPosition.Y.Offset + delta.Y
+        )
+    end
+end))
+
+RegisterGlobalConn(UIS.InputEnded:Connect(function(input)
+    if input == activeDragInput
+        or input.UserInputType == Enum.UserInputType.Touch
+        or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = false
+        activeDragInput = nil
+    end
+end))
+
+RegisterGlobalConn(LP.Idled:Connect(function()
+    pcall(function()
+        VU:CaptureController()
+        VU:ClickButton2(Vector2.zero)
+    end)
+end))
+
+env.BFAutoFarmStop = function()
+    if IsStopped then return end
+    IsStopped = true
+    Alive = false
+    Running = false
+    IsRespawning = false
+    CombatWorkerId += 1
+    BumpEpoch()
+
+    CombatTarget = nil
+    CachedWeapon = nil
+    IsAttacking = false
+
+    CancelMovement("Shutdown")
+    DisableStabilizer()
+    RestoreCharacterCollisions()
+    RestoreModifiedMobs()
+    ClearCharConnections()
+
+    for i = #GlobalConnections, 1, -1 do
+        local conn = GlobalConnections[i]
+        GlobalConnections[i] = nil
+        pcall(function()
+            conn:Disconnect()
+        end)
+    end
+
+    table.clear(CachedCharParts)
+    table.clear(SpawnNodesCache)
+
+    if GUI then
+        pcall(function()
+            GUI:Destroy()
+        end)
+    end
+end
+
+-- ================= STRICT INITIALIZATION SEQUENCE =================
+
+local function InitializeScript()
+    TransitionFSM("INITIALIZING")
+
+    if game.PlaceId ~= Config.FirstSeaPlaceId then
+        TransitionFSM("ERROR")
+        SetRunning(false, "First Sea only (PlaceId 2753915549)")
+        RecordError("Init", "Invalid PlaceId: " .. tostring(game.PlaceId))
+        return false
+    end
+
+    local dbValid, dbErr = ValidateStageDatabase(Stages)
+    if not dbValid then
+        TransitionFSM("ERROR")
+        SetRunning(false, "Stage DB Error: " .. tostring(dbErr))
+        RecordError("Database", dbErr)
+        return false
+    end
+
+    if not LP.Character then
+        LP.CharacterAdded:Wait()
+    end
+
+    local Remotes = RS:WaitForChild("Remotes", 30)
+    CommF = Remotes and Remotes:WaitForChild("CommF_", 30)
+
+    if not CommF then
+        TransitionFSM("ERROR")
+        SetRunning(false, "Remote CommF_ unavailable")
+        RecordError("Init", "CommF_ remote not found")
+        return false
+    end
+
+    if not LP.Team then
+        RemoteManager:Invoke("SetTeam", Config.DefaultTeam)
+    end
+    GetPlayerFaction()
+
+    local Data = LP:WaitForChild("Data", 30)
+    local LevelValue = Data and Data:WaitForChild("Level", 30)
+
+    if not LevelValue then
+        TransitionFSM("ERROR")
+        SetRunning(false, "Level data unavailable")
+        RecordError("Init", "Player Level data not found")
+        return false
+    end
+
+    InitRespawnHandler()
+    StartBackgroundServices()
+    TransitionFSM("CHECKING_TEAM")
+    SetStatus("Ready")
+    return true
+end
+
+if InitializeScript() then
+    task.spawn(function()
+        while Alive do
+            task.wait(Config.MainLoopInterval)
+
+            if Running then
+                local ok, err = xpcall(Step, debug.traceback)
+                if not ok then
+                    TransitionFSM("ERROR")
+                    SetStatus("Error - check Err Diag")
+                    RecordError("Step", err)
+                end
+            end
+        end
+    end)
+    print("[TineHub] TINE_HUB_COMPLETE_REPAIRED initialized successfully")
+end
